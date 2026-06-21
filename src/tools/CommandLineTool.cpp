@@ -3,6 +3,11 @@
 //
 #include "include/tools/CommandLineTool.h"
 #include <QString>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QFileInfo>
+#include <QFile>
+#include <QDir>
 
 CommandLineTool::CommandLineTool(string mode,string resource_dir) {
     string suits = "c,d,h,s";
@@ -90,7 +95,74 @@ void split(const string& s, char c,
 }
 
 
+void CommandLineTool::setGpuOptions(const string& engine, const string& serializer, const string& gpuSolver) {
+    if(!engine.empty()) this->engine = engine;
+    if(!serializer.empty()) this->serializer_path = serializer;
+    if(!gpuSolver.empty()) this->gpu_solver_path = gpuSolver;
+}
+
+// Resolve "auto" to a concrete backend using the benchmarked routing rule:
+// river (5-card) -> CPU; flop (3-card) -> GPU; turn (4-card) -> GPU only when the
+// iteration count is high enough to amortize the GPU pipeline's fixed overhead.
+string CommandLineTool::resolveEngine() {
+    if(this->engine != "auto") return this->engine;
+    if(this->current_round >= 3) return "cpu";                 // river
+    if(this->current_round == 2)                               // turn
+        return (this->max_iteration >= this->gpu_turn_min_iters) ? "gpu" : "cpu";
+    return "gpu";                                              // flop
+}
+
+// Run the external CUDA pipeline (SerializeRiver -> river_gpu --dump) and load the
+// resulting strategy back into the in-memory tree, so a subsequent dump_result
+// produces the same json a CPU solve would. Mirrors the GUI's proven subprocess
+// flow (the MSVC/nvcc engine is ABI-incompatible with this MinGW/Qt binary).
+void CommandLineTool::solveOnGpu() {
+    QString tmpDir   = QDir::tempPath();
+    QString cfgPath  = QDir(tmpDir).filePath("texsolver_cli_config.txt");
+    QString sgPath   = QDir(tmpDir).filePath("texsolver_cli_subgame.txt");
+    QString jsonPath = QDir(tmpDir).filePath("texsolver_cli_gpu.json");
+
+    {   // replay the buffered config for the serializer (it ignores solve/dump cmds)
+        std::ofstream f(cfgPath.toStdString());
+        for(const string& c : this->command_buffer) f << c << "\n";
+    }
+
+    QString serExe = QString::fromStdString(this->serializer_path);
+    QString gpuExe = QString::fromStdString(this->gpu_solver_path);
+    if(!QFile::exists(serExe)) throw runtime_error("GPU serializer not found: " + this->serializer_path);
+    if(!QFile::exists(gpuExe)) throw runtime_error("GPU solver not found: " + this->gpu_solver_path);
+
+    // Prepend the exe dirs to the child PATH so the serializer's Qt/MinGW runtime
+    // DLLs resolve regardless of where this tool is launched from.
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QStringList parts;
+    parts << QFileInfo(serExe).absolutePath() << QFileInfo(gpuExe).absolutePath() << env.value("PATH");
+    env.insert("PATH", parts.join(";"));
+
+    cout << "<<<GPU PIPELINE: serialize>>>" << endl;
+    QProcess ser; ser.setProcessEnvironment(env); ser.setProcessChannelMode(QProcess::ForwardedChannels);
+    ser.start(serExe, QStringList() << "-i" << cfgPath << "-r" << QString::fromStdString(this->resource_dir) << "-o" << sgPath);
+    ser.waitForFinished(-1);
+    if(ser.exitStatus() != QProcess::NormalExit || ser.exitCode() != 0)
+        throw runtime_error(tfm::format("GPU serialize failed (exit %s)", ser.exitCode()));
+
+    cout << "<<<GPU PIPELINE: solve>>>" << endl;
+    QProcess slv; slv.setProcessEnvironment(env); slv.setProcessChannelMode(QProcess::ForwardedChannels);
+    slv.start(gpuExe, QStringList() << "-s" << sgPath << "-d" << jsonPath << "-n" << QString::number(this->max_iteration));
+    slv.waitForFinished(-1);
+    if(slv.exitStatus() != QProcess::NormalExit || slv.exitCode() != 0)
+        throw runtime_error(tfm::format("GPU solve failed (exit %s)", slv.exitCode()));
+
+    this->ps.load_gpu_strategy(this->range_ip, this->range_oop, this->board, jsonPath.toStdString());
+    // On a chance subgame the GPU dump only carries the root street's runout
+    // (slot 0); a deeper dump_result (>=2 rounds) would emit uniform placeholders
+    // for the per-runout sub-streets. Flagged here, warned at dump_result time
+    // (dump_rounds is usually set after start_solve).
+    this->gpu_chance_loaded = (this->current_round < 3);
+}
+
 void CommandLineTool::processCommand(string input) {
+    this->command_buffer.push_back(input);
     vector<string> contents;
     split(input,' ',contents);
     if(contents.size() == 0) contents = {input};
@@ -150,27 +222,40 @@ void CommandLineTool::processCommand(string input) {
         this->ps.build_game_tree(oop_commit,ip_commit,current_round,raise_limit,small_blind,big_blind,stack,*gtbs.get(),allin_threshold);
     }else if(command == "set_max_iteration"){
         this->max_iteration = stoi(paramstr);
+    }else if(command == "set_raise_limit"){
+        this->raise_limit = stoi(paramstr);
     }else if(command == "set_use_isomorphism"){
         this->use_isomorphism = stoi(paramstr);
     }else if(command == "set_print_interval"){
         this->print_interval = stoi(paramstr);
     }else if(command == "start_solve"){
-        cout << "<<<START SOLVING>>>" << endl;
-        this->ps.train(
-                this->range_ip,
-                this->range_oop,
-                this->board,
-                "tmp_log.txt",
-                max_iteration,
-                this->print_interval,
-                "discounted_cfr",
-                -1,
-                this->accuracy,
-                this->use_isomorphism,
-                0, // TODO: enable half float option for command line tool
-                this->thread_number
-        );
+        string eng = this->resolveEngine();
+        cout << "<<<START SOLVING>>> engine=" << eng << endl;
+        if(eng == "gpu"){
+            this->solveOnGpu();
+        }else{
+            this->ps.train(
+                    this->range_ip,
+                    this->range_oop,
+                    this->board,
+                    "tmp_log.txt",
+                    max_iteration,
+                    this->print_interval,
+                    "discounted_cfr",
+                    -1,
+                    this->accuracy,
+                    this->use_isomorphism,
+                    0, // TODO: enable half float option for command line tool
+                    this->thread_number
+            );
+        }
     }else if(command == "dump_result"){
+        if(this->gpu_chance_loaded && this->dump_rounds >= 2){
+            cout << "WARNING: GPU solved a turn/flop subgame but only the root street's "
+                    "runout strategy is available; dump_rounds=" << this->dump_rounds
+                 << " will emit uniform placeholders for deeper per-runout streets. "
+                    "Re-run with --engine cpu for a complete multi-street dump." << endl;
+        }
         string output_file = paramstr;
         this->ps.dump_strategy(QString::fromStdString(output_file),this->dump_rounds);
     }else if(command == "set_dump_rounds"){

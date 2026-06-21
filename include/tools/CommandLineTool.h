@@ -17,6 +17,10 @@ public:
     void startWorking();
     void execFromFile(string input_file);
     void processCommand(string input);
+    // Selects the solve backend: "cpu" (always CPU), "gpu" (always the external
+    // CUDA pipeline), or "auto" (route by board: river->CPU, flop->GPU, turn->GPU
+    // when max_iteration is high enough). Empty serializer/gpuSolver keep defaults.
+    void setGpuOptions(const string& engine, const string& serializer, const string& gpuSolver);
 private:
     enum Mode{
         HOLDEM,
@@ -43,6 +47,16 @@ private:
     int print_interval=10;
     int dump_rounds = 1;
     shared_ptr<GameTreeBuildingSettings> gtbs;
+
+    // engine routing (CPU console <-> external CUDA pipeline)
+    string engine = "cpu";
+    string serializer_path = "cuda/cpu_export/build_ser/release/SerializeRiver.exe";
+    string gpu_solver_path = "cuda/build/river_gpu.exe";
+    int gpu_turn_min_iters = 100;          // turn routes to GPU only at/above this
+    vector<string> command_buffer;         // raw commands, replayed to the serializer
+    bool gpu_chance_loaded = false;        // last solve was GPU on a turn/flop subgame
+    string resolveEngine();
+    void solveOnGpu();
 };
 
 #endif //BINDSOLVER_COMMANDLINETOOL_H

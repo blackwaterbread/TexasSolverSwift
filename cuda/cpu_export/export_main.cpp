@@ -3,12 +3,19 @@
 // Mirrors the logic of src/console.cpp's main_backup but is a real main().
 #include "include/tools/CommandLineTool.h"
 #include "include/tools/argparse.hpp"
+#include <QCoreApplication>
 
 int main(int argc, const char** argv) {
+    // A Qt event loop owner is needed for the QProcess-based GPU pipeline.
+    QCoreApplication app(argc, const_cast<char**>(argv));
+
     ArgumentParser parser;
     parser.addArgument("-i", "--input_file", 1, true);
     parser.addArgument("-r", "--resource_dir", 1, true);
     parser.addArgument("-m", "--mode", 1, true);
+    parser.addArgument("-e", "--engine", 1, true);          // cpu | gpu | auto
+    parser.addArgument("--serializer", 1, true);            // SerializeRiver.exe path
+    parser.addArgument("--gpu_solver", 1, true);            // river_gpu.exe path
     parser.parse(argc, argv);
 
     string input_file = parser.retrieve<string>("input_file");
@@ -19,7 +26,13 @@ int main(int argc, const char** argv) {
     if (mode != "holdem" && mode != "shortdeck")
         throw runtime_error(tfm::format("mode %s error, not in ['holdem','shortdeck']", mode));
 
+    string engine = parser.retrieve<string>("engine");
+    if (engine.empty()) engine = "cpu";
+    if (engine != "cpu" && engine != "gpu" && engine != "auto")
+        throw runtime_error(tfm::format("engine %s error, not in ['cpu','gpu','auto']", engine));
+
     CommandLineTool clt = CommandLineTool(mode, resource_dir);
+    clt.setGpuOptions(engine, parser.retrieve<string>("serializer"), parser.retrieve<string>("gpu_solver"));
     if (input_file.empty()) {
         clt.startWorking();
     } else {
