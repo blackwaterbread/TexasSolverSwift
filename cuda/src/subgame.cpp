@@ -68,6 +68,13 @@ Subgame load_subgame(const std::string& path) {
                 std::istringstream rs(line);
                 for (int i = 0; i < nc; i++) rs >> sg.dealrank[player][(size_t)d * nc + i];
             }
+        } else if (tag == "turnreps") {
+            int n; ss >> n;
+            sg.iso_level1_cards.resize(n);
+            std::getline(in, line);
+            std::istringstream ds(line);
+            for (int i = 0; i < n; i++) ds >> sg.iso_level1_cards[i];
+            std::getline(in, line);   // labels line (unused; dump keys use iso_labels + deal_strs)
         } else if (tag == "iso") {
             ss >> sg.iso_nd_full;
             sg.iso_on = true;
@@ -84,6 +91,14 @@ Subgame load_subgame(const std::string& path) {
                 std::getline(in, line);
                 std::istringstream rs(line);
                 for (int i = 0; i < nc; i++) rs >> sg.iso_perm[player][(size_t)d * nc + i];
+            }
+        } else if (tag == "isorivperm") {
+            int nd, ndr; ss >> nd >> ndr;
+            sg.iso_riverperm.resize((size_t)nd * ndr);
+            for (int d = 0; d < nd; d++) {
+                std::getline(in, line);
+                std::istringstream rs(line);
+                for (int i = 0; i < ndr; i++) rs >> sg.iso_riverperm[(size_t)d * ndr + i];
             }
         } else if (tag == "nnodes") {
             int n; ss >> n;

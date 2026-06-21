@@ -67,6 +67,13 @@ struct Subgame {
     std::vector<int> iso_rep_slot;            // [nd_full]
     std::vector<std::string> iso_labels;      // [nd_full]
     std::vector<int> iso_perm[2];             // [nd_full * ncombos(player)]
+    // Flop only: the reduced level-1 (turn) deal cards. The deepest level (river)
+    // stays full in deal_cards; here the turn level holds just the representatives.
+    // Empty for the turn subgame (its reduced level is the deepest, already in deal_cards).
+    std::vector<int> iso_level1_cards;
+    // Flop dump only: [nd_full * ND] river-index permutation under each full turn
+    // card's suit swap (row = full turn card, col = river index -> remapped index).
+    std::vector<int> iso_riverperm;
 
     int ncombos(int player) const { return (int)ranges[player].size(); }
     int ndeals() const { return (int)deal_cards.size(); }

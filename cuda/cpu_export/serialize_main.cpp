@@ -213,19 +213,22 @@ int main(int argc, const char** argv) {
     vector<int> pdeals;
     for (int L = 0; L < chance_levels; L++) pdeals.push_back(deck_n - board_n - L - 2);
 
-    // ---- suit isomorphism (turn subgame, single chance level) ----
-    // Two suits are equivalent iff the board carries the same rank-set in both AND
-    // both players' ranges are invariant under swapping them. Equivalent runout
-    // cards (same rank, equivalent suits) collapse to one representative; the GPU
-    // engine trains only representatives and re-expands at the chance reduce via the
-    // suit permutation. Card int = rank*4 + suit, so ci%4 = suit, ci/4 = rank.
-    // Flop (2 levels) keeps the full set for now (multi-level iso is future work).
+    // ---- suit isomorphism (level-1 runout card) ----
+    // Two suits are equivalent iff the (root) board carries the same rank-set in both
+    // AND both players' ranges are invariant under swapping them. Equivalent level-1
+    // runout cards (same rank, equivalent suits) collapse to one representative; the
+    // GPU engine trains only representatives and re-expands at the level-1 chance
+    // reduce via the suit permutation. Card int = rank*4 + suit (ci%4 = suit). The
+    // reduced card is the river for a turn subgame and the turn for a flop subgame;
+    // either way it is the FIRST card dealt off the root board, so canon/perm are
+    // computed identically. For the flop the second level (river) stays full.
     bool iso_on = false;
     int nd_iso = ND;
     vector<int> reps;                       // representative card ints (size nd_iso)
     vector<int> rep_slot_full(ND, 0);       // [ND] representative slot per full deal
     vector<vector<int>> iso_perm[2];        // [player][full deal] -> permuted hand idx
-    if (chance_levels == 1) {
+    vector<vector<int>> iso_rivperm;        // flop only: [full turn] -> river index swap
+    if (chance_levels >= 1) {
         int color_hash[4] = {0, 0, 0, 0};   // ranks present on board per suit
         for (int bc : board_ints) color_hash[bc % 4] |= (1 << (bc / 4));
         auto sorted_key = [](int c1, int c2) { if (c1 > c2) std::swap(c1, c2); return c1 * 52 + c2; };
@@ -282,16 +285,31 @@ int main(int argc, const char** argv) {
         }
         iso_on = (nd_iso < ND);
 
+        // Flop: river index permutation under each full turn card's suit swap (for the
+        // dump, which keeps the river full while reducing the turn). Row t, col r ->
+        // index of swap_t(deal_cards[r]) in deal_cards.
+        if (iso_on && chance_levels == 2) {
+            iso_rivperm.resize(ND);
+            for (int t = 0; t < ND; t++) {
+                int s = deal_cards[t] % 4, a = std::min(s, canon[s]), b = std::max(s, canon[s]);
+                auto sw = [&](int x) { return x % 4 == a ? x - a + b : (x % 4 == b ? x - b + a : x); };
+                iso_rivperm[t].resize(ND);
+                for (int r = 0; r < ND; r++) iso_rivperm[t][r] = cardint_fullidx[sw(deal_cards[r])];
+            }
+        }
+
         // Self-check (equilibrium-independent): hand strengths are suit-permutation
-        // invariant, so dealrank at runout c must equal dealrank at its rep with the
-        // hands relabeled by the suit swap. Validates canon + perm before any solve.
-        if (iso_on) {
+        // invariant, so the completed-board rank at runout c must equal the rank at
+        // its representative with the hands relabeled by the suit swap. Validates
+        // canon + perm before any solve. The turn subgame completes the board with c
+        // alone; the flop subgame still needs a river, and the swap must carry to it
+        // too (rank(h@flop+c+r) == rank(perm(h)@flop+rep+swap(r))).
+        if (iso_on && chance_levels == 1) {
             for (int p = 0; p < 2; p++) {
                 for (int t = 0; t < ND; t++) {
                     int ct = deal_cards[t];
                     uint64_t bt = board_long | Card::boardInt2long(ct);
-                    int rep_full = cardint_fullidx[reps[rep_slot_full[t]]];
-                    int crep = deal_cards[rep_full];
+                    int crep = reps[rep_slot_full[t]];
                     uint64_t brep = board_long | Card::boardInt2long(crep);
                     for (int h = 0; h < (int)ranges[p].size(); h++) {
                         PrivateCards& pc = ranges[p][h];
@@ -305,6 +323,34 @@ int main(int argc, const char** argv) {
                 }
             }
             cout << "iso self-check passed: ND " << ND << " -> " << nd_iso << " representatives\n";
+        } else if (iso_on && chance_levels == 2) {
+            for (int p = 0; p < 2; p++) {
+                for (int t = 0; t < ND; t++) {
+                    int ct = deal_cards[t], s = ct % 4, a = std::min(s, canon[s]), b = std::max(s, canon[s]);
+                    auto sw = [&](int x) { return x % 4 == a ? x - a + b : (x % 4 == b ? x - b + a : x); };
+                    int crep = reps[rep_slot_full[t]];
+                    for (int rr = 0; rr < ND; rr++) {
+                        int cr = deal_cards[rr];
+                        if (cr == ct) continue;
+                        int crsw = sw(cr);
+                        uint64_t b5 = board_long | Card::boardInt2long(ct) | Card::boardInt2long(cr);
+                        uint64_t b5r = board_long | Card::boardInt2long(crep) | Card::boardInt2long(crsw);
+                        for (int h = 0; h < (int)ranges[p].size(); h++) {
+                            PrivateCards& pc = ranges[p][h];
+                            int rk_c = (pc.card1 == ct || pc.card2 == ct || pc.card1 == cr || pc.card2 == cr)
+                                       ? -1 : compairer.get_rank(pc.toBoardLong(), b5);
+                            PrivateCards& pr = ranges[p][iso_perm[p][t][h]];
+                            int rk_r = (pr.card1 == crep || pr.card2 == crep || pr.card1 == crsw || pr.card2 == crsw)
+                                       ? -1 : compairer.get_rank(pr.toBoardLong(), b5r);
+                            if (rk_c != rk_r)
+                                throw runtime_error("flop iso self-check failed: player " + to_string(p) + " turn " + to_string(t) +
+                                                    " river " + to_string(rr) + " hand " + to_string(h) +
+                                                    " (" + to_string(rk_c) + " vs " + to_string(rk_r) + ")");
+                        }
+                    }
+                }
+            }
+            cout << "flop iso self-check passed: turn ND " << ND << " -> " << nd_iso << " representatives (river full)\n";
         }
     }
 
@@ -332,6 +378,9 @@ int main(int argc, const char** argv) {
     // the chance reduce re-expands to all ND cards via the iso block below. For the
     // flop (2 levels) iso is not applied yet, so reps == all deal cards (nd_iso==ND).
     if (has_chance) {
+        // `deals` is the DEEPEST level's card set (the one dealrank/showdown index
+        // directly): the reduced river reps for a turn subgame, the full river for a
+        // flop (whose shallower turn level is reduced separately via `turnreps`).
         const vector<int>& emit_deals = (chance_levels == 1) ? reps : deal_cards;
         int nd_eff = (int)emit_deals.size();
         out << "chancelevels " << chance_levels << " " << nd_eff << "\n";
@@ -343,15 +392,26 @@ int main(int argc, const char** argv) {
         out << "\n";
         for (int ci : emit_deals) out << Card::intCard2Str(ci) << " ";
         out << "\n";
-        // Hand ranks at the completed 5-card board, one row per compound runout.
-        // Row index is the base-nd_eff compound deal: turn (1 level, rep cards) or
-        // turn*ND+river (2 levels). rank -1 when the combo collides with a dealt
-        // card, or the compound deal repeats a card (impossible runout).
-        long long nrows = 1; for (int L = 0; L < chance_levels; L++) nrows *= nd_eff;
+        // Flop: the shallower (turn) level deals only the representatives. The river
+        // (deepest, `deals` above) stays full; the engine re-expands the turn at the
+        // level-1 chance reduce. Absent for the turn subgame (turn==deepest there).
+        if (chance_levels == 2) {
+            out << "turnreps " << reps.size() << "\n";
+            for (int ci : reps) out << ci << " ";
+            out << "\n";
+            for (int ci : reps) out << Card::intCard2Str(ci) << " ";
+            out << "\n";
+        }
+        // Hand ranks at the completed 5-card board, one row per compound runout. Row
+        // index is mixed-radix: turn (1 level) = rep slot; flop = turn_rep*ND + river
+        // (turn over representatives, river full). rank -1 when the combo collides
+        // with a dealt card, or the compound deal repeats a card (impossible runout).
+        long long nrows = (chance_levels == 1) ? (long long)reps.size()
+                                               : (long long)reps.size() * ND;
         for (int p = 0; p < 2; p++) {
             out << "dealranks " << p << " " << nrows << " " << ranges[p].size() << "\n";
             if (chance_levels == 1) {
-                for (int ct : emit_deals) {
+                for (int ct : reps) {
                     uint64_t b5 = board_long | Card::boardInt2long(ct);
                     for (auto& pc : ranges[p]) {
                         int rank = (pc.card1 == ct || pc.card2 == ct)
@@ -360,11 +420,9 @@ int main(int argc, const char** argv) {
                     }
                     out << "\n";
                 }
-            } else {  // chance_levels == 2 (flop): rows indexed turn*ND + river
-                for (int t = 0; t < ND; t++) {
-                    int ct = deal_cards[t];
-                    for (int r = 0; r < ND; r++) {
-                        int cr = deal_cards[r];
+            } else {  // chance_levels == 2 (flop): turn over reps, river full
+                for (int ct : reps) {
+                    for (int cr : deal_cards) {
                         if (ct == cr) {  // impossible: same card dealt twice
                             for (size_t k = 0; k < ranges[p].size(); k++) out << "-1 ";
                             out << "\n";
@@ -383,10 +441,11 @@ int main(int argc, const char** argv) {
             }
         }
 
-        // iso block: full runout count, each full deal's representative slot, the
-        // full runout labels (for dump keys), and the per-player hand permutation
-        // mapping each full deal's hands onto its representative's hands. Present
-        // only when the turn board actually reduces (nd_iso < ND).
+        // iso block: full level-1 runout count (ND), each full level-1 card's
+        // representative slot, the full level-1 labels (for dump keys), and the
+        // per-player hand permutation mapping each full level-1 card's hands onto its
+        // representative's hands. The full level-1 set equals deal_cards (deck minus
+        // root board) for both turn and flop. Present only when the level reduces.
         if (iso_on) {
             out << "iso " << ND << "\n";
             out << "isorepslot";
@@ -399,6 +458,18 @@ int main(int argc, const char** argv) {
                 out << "isoperm " << p << " " << ND << " " << ranges[p].size() << "\n";
                 for (int t = 0; t < ND; t++) {
                     for (int h = 0; h < (int)ranges[p].size(); h++) out << iso_perm[p][t][h] << " ";
+                    out << "\n";
+                }
+            }
+            // Flop dump only: the river index permutation under each full turn card's
+            // suit swap. A full turn card c's strategy at river r is the rep's strategy
+            // at river swap_c(r) (river stays full/unreduced in the trainable), so the
+            // dump remaps the river index by this table. Row c, column r -> index of
+            // swap_c(deal_cards[r]) in deal_cards. Identity rows for representatives.
+            if (chance_levels == 2) {
+                out << "isorivperm " << ND << " " << ND << "\n";
+                for (int t = 0; t < ND; t++) {
+                    for (int r = 0; r < ND; r++) out << iso_rivperm[t][r] << " ";
                     out << "\n";
                 }
             }

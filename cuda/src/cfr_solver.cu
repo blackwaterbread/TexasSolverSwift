@@ -514,6 +514,14 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
             cudaMalloc(&d_iso_perm_[p], sz * sizeof(int));
             cudaMemcpy(d_iso_perm_[p], sg.iso_perm[p].data(), sz * sizeof(int), cudaMemcpyHostToDevice);
         }
+        // Flop iso: the turn level deals only the representatives (river stays full in
+        // d_lvl2cards_). Turn subgame leaves iso_level1_cards empty (its reduced level
+        // is the deepest, already the reps in d_deal_cards_/d_lvl1cards_).
+        if (!sg.iso_level1_cards.empty()) {
+            nd_lvl1_ = (int)sg.iso_level1_cards.size();
+            cudaMalloc(&d_lvl1cards_, (size_t)nd_lvl1_ * sizeof(int));
+            cudaMemcpy(d_lvl1cards_, sg.iso_level1_cards.data(), (size_t)nd_lvl1_ * sizeof(int), cudaMemcpyHostToDevice);
+        }
     }
 
     // O(n) showdown structures (used only for the no-chance river case, B==1):
@@ -611,6 +619,7 @@ CudaCfrSolver::~CudaCfrSolver() {
         if (d_dealrank_[p]) cudaFree(d_dealrank_[p]);
     }
     if (d_deal_cards_) cudaFree(d_deal_cards_);
+    if (d_lvl1cards_ && d_lvl1cards_ != d_deal_cards_) cudaFree(d_lvl1cards_);   // owned only for flop iso
     if (d_iso_rep_slot_) cudaFree(d_iso_rep_slot_);
     for (int p = 0; p < 2; p++) if (d_iso_perm_[p]) cudaFree(d_iso_perm_[p]);
     for (int O = 0; O < 2; ++O) {

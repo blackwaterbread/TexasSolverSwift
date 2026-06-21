@@ -1,0 +1,11 @@
+set_pot 10
+set_effective_stack 100
+set_board 7c,7d,2h
+set_range_ip AA,KK,QQ,JJ,TT,99,88,AK,AQs,AJs,KQs,QJs,JTs,T9s,98s,87s,76s
+set_range_oop AA,KK,QQ,JJ,TT,99,AKs,AQs,KQs,QJs,JTs,T9s,98s,A5s,A4s,KJo,QJo
+set_bet_sizes oop,turn,bet,50
+set_bet_sizes ip,turn,bet,50
+set_bet_sizes oop,river,bet,50
+set_bet_sizes ip,river,bet,50
+set_allin_threshold 0.67
+build_tree

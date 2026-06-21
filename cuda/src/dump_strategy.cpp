@@ -49,6 +49,30 @@ static json strat_map_for_full_deal(const Subgame& sg, const Node& nd,
     return jstrat;
 }
 
+// Flop iso variant (2 levels): the trainable slot is turn_rep*ND + river, with the
+// river remapped by the full turn card's suit swap (iso_riverperm) and the hands
+// relabeled by the same swap (iso_perm). Recovers a full (turn, river) runout's
+// strategy from the representative-turn trainable.
+static json strat_map_for_flop_deal(const Subgame& sg, const Node& nd,
+                                    const std::vector<float>& av,
+                                    int turn_full, int river, int ND, int nact, int nc) {
+    const int* perm = sg.iso_perm[nd.player].data() + (size_t)turn_full * nc;
+    int river_rep = sg.iso_riverperm[(size_t)turn_full * ND + river];
+    size_t base = ((size_t)sg.iso_rep_slot[turn_full] * ND + river_rep) * nact * nc;
+    json jstrat = json::object();
+    for (int h = 0; h < nc; h++) {
+        int ph = perm[h];
+        json probs = json::array();
+        for (int a = 0; a < nact; a++) {
+            size_t idx = base + (size_t)a * nc + ph;
+            float v = (idx < av.size()) ? av[idx] : 0.0f;
+            probs.push_back(v);
+        }
+        jstrat[sg.ranges[nd.player][h].label] = probs;
+    }
+    return jstrat;
+}
+
 void dump_strategy_json(const Subgame& sg,
                         const std::vector<std::vector<float>>& avgs,
                         const std::string& path) {
@@ -88,12 +112,26 @@ void dump_strategy_json(const Subgame& sg,
         if (level <= 0) {
             // No chance above: a single strategy slot (slot 0), flat layout.
             jn["strategy"] = strat_map_for_slot(sg, nd, av, 0, nact, nc);
-        } else if (sg.iso_on) {
-            // Turn iso (single level): trainable holds only representatives; emit a
-            // strategy per real runout by relabeling the rep's hands (see above).
+        } else if (sg.iso_on && level == 1) {
+            // Level-1 iso (turn subgame's river nodes, or a flop's turn nodes): the
+            // trainable holds only representatives; emit a strategy per real runout by
+            // relabeling the rep's hands.
             json jdeals = json::object();
             for (int c = 0; c < sg.iso_nd_full; c++)
                 jdeals[sg.iso_labels[c]] = strat_map_for_full_deal(sg, nd, av, c, nact, nc);
+            jn["deals"] = jdeals;
+        } else if (sg.iso_on && level == 2) {
+            // Flop iso river nodes: expand both the reduced turn (via perm) and the
+            // full river (via the river-index remap). Key is "turn,river".
+            const int RD = ND;   // river is the full deal set
+            json jdeals = json::object();
+            for (int c = 0; c < sg.iso_nd_full; c++) {
+                for (int r = 0; r < RD; r++) {
+                    if (sg.iso_labels[c] == sg.deal_strs[r]) continue;   // impossible: turn==river
+                    std::string key = sg.iso_labels[c] + "," + sg.deal_strs[r];
+                    jdeals[key] = strat_map_for_flop_deal(sg, nd, av, c, r, RD, nact, nc);
+                }
+            }
             jn["deals"] = jdeals;
         } else {
             // One trainset per compound runout. Slot b is base-ND with `level`
