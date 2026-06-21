@@ -1,0 +1,21 @@
+set_pot 50
+set_effective_stack 200
+set_board Qs,Jh,2h,5c,8d
+set_range_ip 22,33,44,55,66,77,88,99,TT,JJ,QQ,KK,AA,A2s,A3s,A4s,A5s,A6s,A7s,A8s,A9s,ATs,AJs,AQs,AKs,K7s,K8s,K9s,KTs,KJs,KQs,Q9s,QTs,QJs,JTs,T9s,98s,A8o,A9o,ATo,AJo,AQo,AKo,KTo,KJo,KQo,QJo
+set_range_oop 22,33,44,55,66,77,88,99,TT,JJ,QQ,KK,AA,A4s,A5s,A6s,A7s,A8s,A9s,ATs,AJs,AQs,AKs,K8s,K9s,KTs,KJs,KQs,Q9s,QTs,QJs,J9s,JTs,T9s,A9o,ATo,AJo,AQo,AKo,KJo,KQo
+set_bet_sizes oop,river,bet,33,75
+set_bet_sizes oop,river,raise,60
+set_bet_sizes oop,river,allin
+set_bet_sizes ip,river,bet,33,75
+set_bet_sizes ip,river,raise,60
+set_bet_sizes ip,river,allin
+set_allin_threshold 0.67
+build_tree
+set_thread_num 8
+set_accuracy 0
+set_max_iteration 200
+set_print_interval 50
+set_use_isomorphism 0
+start_solve
+set_dump_rounds 2
+dump_result cuda/configs/golden_river_big.json
