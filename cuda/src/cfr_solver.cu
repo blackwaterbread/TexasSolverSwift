@@ -395,6 +395,26 @@ int CudaCfrSolver::ntrainsets(int nodeid) const {
     return ipow(ND_, level(nodeid));
 }
 
+// Checked device allocation: on failure report what failed, how much was needed,
+// and how much VRAM remained, then throw. A full-range flop subgame's trainables
+// are GB-scale; an unchecked cudaMalloc would otherwise return null and crash with
+// a confusing device-side fault deep in a kernel instead of a clear OOM message.
+static void* dmalloc(size_t bytes, const char* what) {
+    void* p = nullptr;
+    cudaError_t e = cudaMalloc(&p, bytes);
+    if (e != cudaSuccess || p == nullptr) {
+        size_t freeB = 0, totB = 0;
+        cudaMemGetInfo(&freeB, &totB);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "cudaMalloc failed for %s: needed %.1f MB, only %.1f MB free of %.1f MB (%s)",
+                 what, bytes / 1048576.0, freeB / 1048576.0, totB / 1048576.0,
+                 cudaGetErrorString(e));
+        throw std::runtime_error(msg);
+    }
+    return p;
+}
+
 CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
     root_round_ = sg.nodes[sg.root].round;
     ND_ = std::max(1, sg.ndeals());
@@ -409,7 +429,7 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
         cudaMalloc(&d_rank_[p], n * sizeof(int)); cudaMemcpy(d_rank_[p], rk.data(), n * sizeof(int), cudaMemcpyHostToDevice);
         if (sg.has_chance && !sg.dealrank[p].empty()) {
             size_t sz = sg.dealrank[p].size();
-            cudaMalloc(&d_dealrank_[p], sz * sizeof(int));
+            d_dealrank_[p] = (int*)dmalloc(sz * sizeof(int), "dealrank");
             cudaMemcpy(d_dealrank_[p], sg.dealrank[p].data(), sz * sizeof(int), cudaMemcpyHostToDevice);
         }
     }
@@ -456,9 +476,9 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
                 std::sort(idx.begin(), idx.end(), [&](int x, int y) { return row[x] < row[y]; });
                 for (int k = 0; k < nc; ++k) { order[b * nc + k] = idx[k]; sranks[b * nc + k] = row[idx[k]]; }
             }
-            cudaMalloc(&d_dealorder_[O], order.size() * sizeof(int));
+            d_dealorder_[O] = (int*)dmalloc(order.size() * sizeof(int), "dealorder");
             cudaMemcpy(d_dealorder_[O], order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMalloc(&d_dealsortedranks_[O], sranks.size() * sizeof(int));
+            d_dealsortedranks_[O] = (int*)dmalloc(sranks.size() * sizeof(int), "dealsortedranks");
             cudaMemcpy(d_dealsortedranks_[O], sranks.data(), sranks.size() * sizeof(int), cudaMemcpyHostToDevice);
         }
     }
@@ -467,6 +487,23 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
     d_rplus_.assign(N, nullptr);
     d_cum_.assign(N, nullptr);
     nact_.assign(N, 0);
+
+    // VRAM pre-flight. Trainables dominate the footprint (sets*nact*nc fp16, twice
+    // for rplus+cum), and a full-range flop (sets=ND^2) is GB-scale. Estimate and
+    // report up front; dmalloc below fails with a clear OOM message if it won't fit.
+    size_t trainable_bytes = 0;
+    for (int i = 0; i < N; ++i) {
+        const Node& nd = sg.nodes[i];
+        if (nd.type != NT_ACTION) continue;
+        size_t sz = (size_t)ntrainsets(i) * nd.children.size() * ncards_[nd.player];
+        trainable_bytes += sz * sizeof(__half) * 2;   // rplus + cum
+    }
+    {
+        size_t freeB = 0, totB = 0; cudaMemGetInfo(&freeB, &totB);
+        printf("  VRAM: trainables ~%.0f MB (rplus+cum fp16) | %.0f MB free of %.0f MB\n",
+               trainable_bytes / 1048576.0, freeB / 1048576.0, totB / 1048576.0);
+    }
+
     for (int i = 0; i < N; ++i) {
         const Node& nd = sg.nodes[i];
         if (nd.type != NT_ACTION) continue;
@@ -475,8 +512,8 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
         int sets = ntrainsets(i);
         size_t sz = (size_t)sets * nact * nc;
         nact_[i] = nact;
-        cudaMalloc(&d_rplus_[i], sz * sizeof(__half)); cudaMemset(d_rplus_[i], 0, sz * sizeof(__half));
-        cudaMalloc(&d_cum_[i], sz * sizeof(__half)); cudaMemset(d_cum_[i], 0, sz * sizeof(__half));
+        d_rplus_[i] = (__half*)dmalloc(sz * sizeof(__half), "trainable rplus"); cudaMemset(d_rplus_[i], 0, sz * sizeof(__half));
+        d_cum_[i] = (__half*)dmalloc(sz * sizeof(__half), "trainable cum"); cudaMemset(d_cum_[i], 0, sz * sizeof(__half));
     }
 
     // LIFO scratch arena. Batched walk widens every scratch buffer by the node's
@@ -486,7 +523,7 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
     int maxB = ipow(ND_, sg.chance_levels);
     size_t need = (size_t)maxnc * 64 * (size_t)maxB;
     arena_cap_ = std::max((size_t)256 * 1024 * 1024 / sizeof(float), need);
-    cudaMalloc(&arena_, arena_cap_ * sizeof(float));
+    arena_ = (float*)dmalloc(arena_cap_ * sizeof(float), "scratch arena");
 
     cudaStreamCreate(&stream_);
     cudaMalloc(&d_coefs_, 2 * sizeof(float));
@@ -707,7 +744,16 @@ double CudaCfrSolver::train(int iters) {
 
     cudaFree(d_init_[0]); cudaFree(d_init_[1]);
     d_init_[0] = d_init_[1] = nullptr;
+
+    // Regrets are no longer needed (averaging/exploitability read only d_cum_).
+    // Release them so the post-training peak (cum fp16 + fp32 avg strategy) is
+    // smaller — the binding constraint for large flop subgames.
+    freeRegrets();
     return std::chrono::duration<double>(t1 - t0).count();
+}
+
+void CudaCfrSolver::freeRegrets() {
+    for (auto& p : d_rplus_) { if (p) { cudaFree(p); p = nullptr; } }
 }
 
 std::vector<std::vector<float>> CudaCfrSolver::averageStrategies() {
@@ -720,7 +766,7 @@ std::vector<std::vector<float>> CudaCfrSolver::averageStrategies() {
         int nc = ncards_[sg_.nodes[i].player];
         int sets = ntrainsets(i);
         size_t sz = (size_t)sets * nact * nc;
-        float* d_avg = nullptr; cudaMalloc(&d_avg, sz * sizeof(float));
+        float* d_avg = (float*)dmalloc(sz * sizeof(float), "avg-strategy scratch");
         for (int s = 0; s < sets; ++s)
             g_avg<<<blocks_for(nc, T), T>>>(d_cum_[i] + (size_t)s * nact * nc,
                                             d_avg + (size_t)s * nact * nc, nact, nc);
@@ -740,7 +786,7 @@ double CudaCfrSolver::exploitability() {
     for (int i = 0; i < N; ++i) {
         if (sg_.nodes[i].type != NT_ACTION) continue;
         size_t sz = avgs[i].size();
-        cudaMalloc(&d_avgstrat_[i], sz * sizeof(float));
+        d_avgstrat_[i] = (float*)dmalloc(sz * sizeof(float), "best-response avg strategy");
         cudaMemcpy(d_avgstrat_[i], avgs[i].data(), sz * sizeof(float), cudaMemcpyHostToDevice);
     }
 

@@ -56,6 +56,12 @@ private:
 
     int level(int nodeid) const;   // chance depth = node.round - root_round
 
+    // Frees the per-node regret buffers (d_rplus_). They are only needed during
+    // training; averageStrategies()/exploitability() read d_cum_ (and a transient
+    // fp32 avg), so releasing them after train() lowers the post-training VRAM
+    // peak — the lever that matters for GB-scale flop subgames. Idempotent.
+    void freeRegrets();
+
     // Writes payoff into caller-provided d_out. Buffers carry a batch dimension
     // B = ND^level (1 above all chances): d_reach is [B*ncards(opp)], d_out is
     // [B*ncards(player)]. The batch index equals the compound deal/trainset slot.
