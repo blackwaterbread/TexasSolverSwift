@@ -5,6 +5,7 @@
 #include "validate.h"
 #include "cfr_solver.h"
 #include "compare_golden.h"
+#include "dump_strategy.h"
 
 // River-subgame GPU solver entry point.
 // Phase 2: load the serialized subgame and report a summary (parsing validation).
@@ -12,11 +13,13 @@
 int main(int argc, char** argv) {
     std::string subgame_path = "cuda/configs/subgame.txt";
     std::string golden_path = "cuda/configs/golden_river.json";
+    std::string dump_path;   // when set: solve, write strategy json, skip golden compare
     int iters = 200;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if ((a == "-s" || a == "--subgame") && i + 1 < argc) subgame_path = argv[++i];
         else if ((a == "-g" || a == "--golden") && i + 1 < argc) golden_path = argv[++i];
+        else if ((a == "-d" || a == "--dump") && i + 1 < argc) dump_path = argv[++i];
         else if ((a == "-n" || a == "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
     }
 
@@ -57,6 +60,27 @@ int main(int argc, char** argv) {
     printf("]\n");
 
     bool ok = true, ok4 = true;
+    if (!dump_path.empty()) {
+        // GUI mode: solve and dump the strategy json, no golden available.
+        const char* kind = sg.chance_levels >= 2 ? "flop/2-chance"
+                         : sg.chance_levels == 1 ? "turn/1-chance" : "river";
+        printf("--- full CFR solve (%s), dump mode ---\n", kind);
+        texgpu::CudaCfrSolver solver(sg);
+        double secs = solver.train(iters);
+        auto avgs = solver.averageStrategies();
+        printf("solved %d iterations on GPU in %.3f s (%.2f iters/s).\n",
+               iters, secs, iters / secs);
+        try {
+            texgpu::dump_strategy_json(sg, avgs, dump_path);
+        } catch (const std::exception& e) {
+            printf("failed to dump strategy: %s\n", e.what());
+            return 5;
+        }
+        printf("strategy written to %s\n", dump_path.c_str());
+        solver.exploitability();
+        return 0;
+    }
+
     if (!sg.has_chance) {
         // River-only leaf/trainable unit checks use base ranks.
         printf("--- leaf kernel validation ---\n");

@@ -20,6 +20,7 @@ add_executable(river_gpu
   src/subgame.cpp
   src/validate.cpp
   src/compare_golden.cpp
+  src/dump_strategy.cpp
   src/cuda_kernels.cu
   src/cfr_solver.cu
 )

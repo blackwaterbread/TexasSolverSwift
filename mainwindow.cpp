@@ -3,6 +3,13 @@
 #include "stdio.h"
 #include "include/runtime/qsolverjob.h"
 #include <QFileDialog>
+#include <QProcess>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QCoreApplication>
+#include <QTextStream>
+#include <QSettings>
 #include "include/library.h"
 
 QSTextEdit* MainWindow::s_textEdit = 0;
@@ -283,6 +290,32 @@ void MainWindow::on_actionexport_triggered(){
                                "parameters/output_parameters.txt",
                                tr("Text file (*.txt)"));
     if(fileName.isNull())return;
+    QString output_text = generate_config_text();
+
+    setlocale(LC_ALL,"");
+
+    ofstream fileWriter;
+    fileWriter.open(fileName.toLocal8Bit());
+    QMessageBox msgBox;
+    QString message;
+    if(!fileWriter.fail()){
+        fileWriter << output_text.toStdString();
+        fileWriter.flush();
+        fileWriter.close();
+
+         message = QObject::tr("save success");
+    }else{
+        message = QObject::tr("save failed, file cannot be open");
+    }
+    qDebug().noquote() << message;
+    msgBox.setText(message);
+    setlocale(LC_CTYPE, "C");
+    msgBox.exec();
+}
+
+// Builds the solver config text (same format consumed by the console / GPU
+// SerializeRiver tools) from the current GUI fields.
+QString MainWindow::generate_config_text(){
     QString output_text = "";
     QTextStream out(&output_text);
     out << "set_pot " << this->ui->potText->text().trimmed();
@@ -371,33 +404,109 @@ void MainWindow::on_actionexport_triggered(){
     out << "start_solve";
     out << "\n";
 
-    this->setWindowTitle(tr("Settings"));
     QSettings setting("TexasSolver", "Setting");
     setting.beginGroup("solver");
     int dump_round = setting.value("dump_round").toInt();
     out << "set_dump_rounds " << dump_round;
     out << "\n";
     out << "dump_result output_result.json";
+    return output_text;
+}
 
-    setlocale(LC_ALL,"");
+// Runs the GPU pipeline as external processes (the CUDA engine is built with
+// MSVC/nvcc and is ABI-incompatible with this MinGW+Qt app, so it cannot be
+// linked in): write config -> SerializeRiver.exe -> river_gpu.exe --dump.
+// Output and progress are streamed to the log window.
+void MainWindow::on_solveGpuButton_clicked(){
+    QSettings setting("TexasSolver", "Setting");
+    setting.beginGroup("gpu");
+    QString serExe = setting.value("serializer_path",
+                        "cuda/cpu_export/build_ser/release/SerializeRiver.exe").toString();
+    QString gpuExe = setting.value("solver_path", "cuda/build/river_gpu.exe").toString();
+    QString resourceDir = setting.value("resource_dir", "resources").toString();
+    setting.endGroup();
 
-    ofstream fileWriter;
-    fileWriter.open(fileName.toLocal8Bit());
-    QMessageBox msgBox;
-    QString message;
-    if(!fileWriter.fail()){
-        fileWriter << output_text.toStdString();
-        fileWriter.flush();
-        fileWriter.close();
+    auto log = [this](const QString& s){
+        this->ui->logOutput->log_with_signal(s);
+    };
 
-         message = QObject::tr("save success");
-    }else{
-        message = QObject::tr("save failed, file cannot be open");
+    if(!QFile::exists(serExe)){
+        log(tr("GPU serializer not found: ") + serExe +
+            tr("  (set [gpu]/serializer_path in settings)"));
+        return;
     }
-    qDebug().noquote() << message;
-    msgBox.setText(message);
-    setlocale(LC_CTYPE, "C");
-    msgBox.exec();
+    if(!QFile::exists(gpuExe)){
+        log(tr("GPU solver not found: ") + gpuExe +
+            tr("  (set [gpu]/solver_path in settings)"));
+        return;
+    }
+
+    QString cfgPath = QDir::temp().filePath("texassolver_gpu_config.txt");
+    QString subgamePath = QDir::temp().filePath("texassolver_gpu_subgame.txt");
+    QString outPath = QDir::current().filePath("output_result_gpu.json");
+    int iters = this->ui->iterationText->text().toInt();
+    if(iters <= 0) iters = 200;
+
+    // write the config the serializer consumes
+    {
+        QFile cfgFile(cfgPath);
+        if(!cfgFile.open(QIODevice::WriteOnly | QIODevice::Text)){
+            log(tr("Failed to write GPU config file: ") + cfgPath);
+            return;
+        }
+        QTextStream ts(&cfgFile);
+        ts << generate_config_text();
+        cfgFile.close();
+    }
+
+    // SerializeRiver is a MinGW+Qt console exe, so it needs the same Qt/MinGW
+    // runtime DLLs as this app. Prepend the app dir (where those DLLs are
+    // deployed) and the exe dirs to the child PATH so they resolve.
+    QProcessEnvironment childEnv = QProcessEnvironment::systemEnvironment();
+    QStringList pathParts;
+    pathParts << QCoreApplication::applicationDirPath()
+              << QFileInfo(serExe).absolutePath()
+              << QFileInfo(gpuExe).absolutePath()
+              << childEnv.value("PATH");
+    childEnv.insert("PATH", pathParts.join(";"));
+
+    log(tr("=== GPU pipeline: serializing subgame ==="));
+    QProcess* ser = new QProcess(this);
+    ser->setProcessEnvironment(childEnv);
+    ser->setProcessChannelMode(QProcess::MergedChannels);
+    connect(ser, &QProcess::readyReadStandardOutput, this, [this, ser](){
+        this->ui->logOutput->log_with_signal(QString::fromLocal8Bit(ser->readAll()).trimmed());
+    });
+    connect(ser, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this, ser, gpuExe, subgamePath, outPath, iters, childEnv](int code, QProcess::ExitStatus){
+        if(code != 0){
+            this->ui->logOutput->log_with_signal(tr("Serialization failed (exit %1).").arg(code));
+            ser->deleteLater();
+            return;
+        }
+        this->ui->logOutput->log_with_signal(tr("=== GPU pipeline: solving on GPU ==="));
+        QProcess* slv = new QProcess(this);
+        slv->setProcessEnvironment(childEnv);
+        slv->setProcessChannelMode(QProcess::MergedChannels);
+        connect(slv, &QProcess::readyReadStandardOutput, this, [this, slv](){
+            this->ui->logOutput->log_with_signal(QString::fromLocal8Bit(slv->readAll()).trimmed());
+        });
+        connect(slv, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+                [this, slv, outPath](int scode, QProcess::ExitStatus){
+            if(scode == 0)
+                this->ui->logOutput->log_with_signal(tr("GPU solve done. Strategy: ") + outPath);
+            else
+                this->ui->logOutput->log_with_signal(tr("GPU solve failed (exit %1).").arg(scode));
+            slv->deleteLater();
+        });
+        slv->start(gpuExe, QStringList() << "-s" << subgamePath
+                                         << "-d" << outPath
+                                         << "-n" << QString::number(iters));
+        ser->deleteLater();
+    });
+    ser->start(serExe, QStringList() << "-i" << cfgPath
+                                     << "-r" << resourceDir
+                                     << "-o" << subgamePath);
 }
 
 void MainWindow::on_actionSettings_triggered(){

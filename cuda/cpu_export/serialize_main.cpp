@@ -136,6 +136,8 @@ int main(int argc, const char** argv) {
             }
         } else if (command == "set_allin_threshold") {
             allin_threshold = stof(paramstr);
+        } else if (command == "set_raise_limit") {
+            raise_limit = stoi(paramstr);
         } else if (command == "build_tree") {
             game_tree = make_shared<GameTree>(deck, oop_commit, ip_commit, current_round,
                                               raise_limit, small_blind, big_blind, stack,
