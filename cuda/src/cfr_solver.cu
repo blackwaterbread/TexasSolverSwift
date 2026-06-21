@@ -313,44 +313,62 @@ __global__ void g_max_b(float* dst, const float* src, int n) {
     if (i < n) dst[i] = fmaxf(dst[i], src[i]);
 }
 
-// dst[b*nc+h] += strat[b][a][h] * util[b*nc+h]   (pn == nc for own-action nodes)
-__global__ void g_fma_strat_b(float* dst, const float* strat, const float* util, int a, int nc, int nact, int B) {
+// Fused per-action kernels (one launch instead of nact). All are algorithm-
+// identical to the per-action loops they replace; they cut the captured graph's
+// node count and widen each kernel's grid for better occupancy.
+
+// Opponent node: scale the opponent reach by every action's strategy at once.
+// out[a*B*nc + b*nc + h] = reach[b*nc+h] * strat[(b*nact+a)*nc + h]
+__global__ void g_row_mul_all(const float* reach, const float* strat, float* out, int nc, int nact, int B) {
+    size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)nact * B * nc;
+    if (t >= total) return;
+    size_t bn = (size_t)B * nc;
+    int a = (int)(t / bn);
+    size_t r = t - (size_t)a * bn;           // b*nc + h within one action
+    int b = (int)(r / nc), h = (int)(r % nc);
+    out[t] = reach[r] * strat[(size_t)b * nact * nc + a * nc + h];
+}
+
+// Opponent node: dst[i] = sum over actions of utils[a][i].  (Bpn = B*pn)
+__global__ void g_sum_utils(float* dst, const float* utils, int Bpn, int nact) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= Bpn) return;
+    float s = 0.0f;
+    for (int a = 0; a < nact; ++a) s += utils[(size_t)a * Bpn + t];
+    dst[t] = s;
+}
+
+// Own-action node: dst[b*nc+h] = sum_a strat[(b*nact+a)*nc+h] * utils[a*B*nc + b*nc+h].
+__global__ void g_fma_strat_all(float* dst, const float* strat, const float* utils, int nc, int nact, int B) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= B * nc) return;
     int b = t / nc, h = t % nc;
-    dst[t] += strat[(size_t)b * nact * nc + a * nc + h] * util[t];
+    const float* st = strat + (size_t)b * nact * nc;
+    size_t bn = (size_t)B * nc;
+    float s = 0.0f;
+    for (int a = 0; a < nact; ++a) s += st[a * nc + h] * utils[(size_t)a * bn + t];
+    dst[t] = s;
 }
 
-__global__ void g_set_regret_row_b(float* regret, const float* util, const float* pay, int a, int nc, int nact, int B) {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= B * nc) return;
-    int b = t / nc, h = t % nc;
-    regret[(size_t)b * nact * nc + a * nc + h] = util[t] - pay[t];
-}
-
-// DCFR discount coefficients for this iteration, kept device-resident so the
-// captured CUDA graph stays static across iterations (only this 2-float buffer
-// changes per replay). alpha=1.5, gamma=2 (beta/theta are constants in g_update_b).
-__global__ void g_set_coefs(float* coefs, int iter) {
-    float t = (float)(iter + 1);
-    float a = powf(t, 1.5f);
-    coefs[0] = a / (1.0f + a);                  // alpha_coef
-    coefs[1] = powf(t / (t + 1.0f), 2.0f);      // strat_coef
-}
-
-__global__ void g_update_b(const float* regret, __half* rplus, __half* cum, int nact, int nc,
-                           const float* coefs, float beta, float theta, int B) {
+// Own-action node: DCFR update with the per-action regret computed inline from
+// utils/pay (no materialized regret buffer). regret_a = utils[a*B*nc + t] - pay[t]
+// (pn == nc here, so b*pn+h == t). Replaces nact g_set_regret_row_b + g_update_b.
+__global__ void g_update_utils_b(const float* utils, const float* pay, __half* rplus, __half* cum,
+                                 int nact, int nc, const float* coefs, float beta, float theta, int B) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= B * nc) return;
     int b = t / nc, h = t % nc;
     float alpha_coef = coefs[0], strat_coef = coefs[1];
-    const float* rg = regret + (size_t)b * nact * nc;
     __half* rp = rplus + (size_t)b * nact * nc;
     __half* cm = cum + (size_t)b * nact * nc;
+    size_t bn = (size_t)B * nc;
+    float paysub = pay[t];
     float rsum = 0.0f;
     for (int a = 0; a < nact; ++a) {
         int idx = a * nc + h;
-        float v = rg[idx] + __half2float(rp[idx]);
+        float regret = utils[(size_t)a * bn + t] - paysub;
+        float v = regret + __half2float(rp[idx]);
         v = (v > 0.0f) ? v * alpha_coef : v * beta;
         rp[idx] = __float2half(v);
         if (v > 0.0f) rsum += v;
@@ -361,6 +379,16 @@ __global__ void g_update_b(const float* regret, __half* rplus, __half* cum, int 
         float s = (rsum > 0.0f) ? (rpv > 0.0f ? rpv / rsum : 0.0f) : (1.0f / nact);
         cm[idx] = __float2half(__half2float(cm[idx]) * theta + s * strat_coef);
     }
+}
+
+// DCFR discount coefficients for this iteration, kept device-resident so the
+// captured CUDA graph stays static across iterations (only this 2-float buffer
+// changes per replay). alpha=1.5, gamma=2 (beta/theta constants in g_update_utils_b).
+__global__ void g_set_coefs(float* coefs, int iter) {
+    float t = (float)(iter + 1);
+    float a = powf(t, 1.5f);
+    coefs[0] = a / (1.0f + a);                  // alpha_coef
+    coefs[1] = powf(t / (t + 1.0f), 2.0f);      // strat_coef
 }
 
 __global__ void g_avg(const __half* cum, float* avg, int nact, int nc) {
@@ -671,31 +699,21 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
     g_curr_strat_b<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(rplus, d_strat, nact, nc, B);
 
     float* utils = arena_alloc((size_t)nact * B * pn);   // [a][b][pn]
-    for (int a = 0; a < nact; ++a) {
-        float* util_a = utils + (size_t)a * B * pn;
-        if (np != player) {
-            float* d_newreach = arena_alloc((size_t)B * nc);   // nc == on here
-            g_row_mul_b<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(d_reach, d_strat, d_newreach, a, nc, nact, B);
-            cfr(player, nd.children[a], d_newreach, util_a);
-        } else {
-            cfr(player, nd.children[a], d_reach, util_a);
-        }
-    }
-
-    cudaMemsetAsync(d_out, 0, (size_t)B * pn * sizeof(float), stream_);
-    if (np == player) {
+    if (np != player) {
+        // Opponent node: scale reach by every action's strategy in one launch,
+        // recurse each child, then sum the action utilities.
+        float* d_newreach = arena_alloc((size_t)nact * B * nc);   // nc == on here
+        g_row_mul_all<<<blocks_for((size_t)nact * B * nc, T), T, 0, stream_>>>(d_reach, d_strat, d_newreach, nc, nact, B);
         for (int a = 0; a < nact; ++a)
-            g_fma_strat_b<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(d_out, d_strat, utils + (size_t)a * B * pn, a, nc, nact, B);
+            cfr(player, nd.children[a], d_newreach + (size_t)a * B * nc, utils + (size_t)a * B * pn);
+        g_sum_utils<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_out, utils, (int)((size_t)B * pn), nact);
     } else {
+        // Own-action node: reach unchanged; strategy-weight the action utilities
+        // and run the fused DCFR update (regret computed inline from utils/pay).
         for (int a = 0; a < nact; ++a)
-            g_add<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_out, utils + (size_t)a * B * pn, (int)((size_t)B * pn));
-    }
-
-    if (np == player) {
-        float* d_regret = arena_alloc((size_t)B * nact * nc);
-        for (int a = 0; a < nact; ++a)
-            g_set_regret_row_b<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(d_regret, utils + (size_t)a * B * pn, d_out, a, nc, nact, B);
-        g_update_b<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(d_regret, rplus, cum, nact, nc,
+            cfr(player, nd.children[a], d_reach, utils + (size_t)a * B * pn);
+        g_fma_strat_all<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(d_out, d_strat, utils, nc, nact, B);
+        g_update_utils_b<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(utils, d_out, rplus, cum, nact, nc,
                                                          d_coefs_, 0.5f /*beta*/, 0.9f /*theta*/, B);
     }
 
