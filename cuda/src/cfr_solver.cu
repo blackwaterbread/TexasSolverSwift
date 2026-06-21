@@ -291,28 +291,6 @@ __global__ void g_curr_strat_b(const __half* rplus, float* strat, int nact, int 
     }
 }
 
-__global__ void g_row_mul_b(const float* reach, const float* strat, float* out, int a, int nc, int nact, int B) {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= B * nc) return;
-    int b = t / nc, h = t % nc;
-    out[t] = reach[t] * strat[(size_t)b * nact * nc + a * nc + h];
-}
-
-__global__ void g_add(float* dst, const float* src, int n) {
-    int h = blockIdx.x * blockDim.x + threadIdx.x;
-    if (h < n) dst[h] += src[h];
-}
-
-// Best-response helpers (exploitability diagnostic): fill and elementwise max.
-__global__ void g_fill(float* d, float v, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) d[i] = v;
-}
-__global__ void g_max_b(float* dst, const float* src, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = fmaxf(dst[i], src[i]);
-}
-
 // Fused per-action kernels (one launch instead of nact). All are algorithm-
 // identical to the per-action loops they replace; they cut the captured graph's
 // node count and widen each kernel's grid for better occupancy.
@@ -337,6 +315,17 @@ __global__ void g_sum_utils(float* dst, const float* utils, int Bpn, int nact) {
     float s = 0.0f;
     for (int a = 0; a < nact; ++a) s += utils[(size_t)a * Bpn + t];
     dst[t] = s;
+}
+
+// Best-response player node: dst[i] = max over actions of utils[a][i]. One launch
+// replacing g_fill(-inf) + nact g_max_b; algorithm-identical (the -1e30f seed makes
+// the all-skipped case match the old fill). (Bpn = B*pn)
+__global__ void g_max_all(float* dst, const float* utils, int Bpn, int nact) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= Bpn) return;
+    float m = -1e30f;
+    for (int a = 0; a < nact; ++a) m = fmaxf(m, utils[(size_t)a * Bpn + t]);
+    dst[t] = m;
 }
 
 // Own-action node: dst[b*nc+h] = sum_a strat[(b*nact+a)*nc+h] * utils[a*B*nc + b*nc+h].
@@ -668,24 +657,22 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
 
     if (br) {
         // Best response: cfr-player maxes over actions; opponent plays avg strategy.
+        // Same fused per-action kernels as the train path (g_row_mul_all/g_sum_utils),
+        // with g_max_all for the BR player's max — algorithm-identical to the old
+        // per-action g_fill/g_max_b/g_row_mul_b/g_add loops, fewer launches.
         size_t mark = arena_top_;
         float* utils = arena_alloc((size_t)nact * B * pn);
         if (np == player) {                         // BR player: reach unchanged, max
             for (int a = 0; a < nact; ++a)
                 cfr(player, nd.children[a], d_reach, utils + (size_t)a * B * pn, true);
-            g_fill<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_out, -1e30f, (int)((size_t)B * pn));
-            for (int a = 0; a < nact; ++a)
-                g_max_b<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_out, utils + (size_t)a * B * pn, (int)((size_t)B * pn));
+            g_max_all<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_out, utils, (int)((size_t)B * pn), nact);
         } else {                                    // opponent: avg-strategy reach, sum
             float* avg = d_avgstrat_[nodeid];       // [B*nact*nc] average strategy
-            for (int a = 0; a < nact; ++a) {
-                float* d_newreach = arena_alloc((size_t)B * nc);
-                g_row_mul_b<<<blocks_for((size_t)B * nc, T), T, 0, stream_>>>(d_reach, avg, d_newreach, a, nc, nact, B);
-                cfr(player, nd.children[a], d_newreach, utils + (size_t)a * B * pn, true);
-            }
-            cudaMemsetAsync(d_out, 0, (size_t)B * pn * sizeof(float), stream_);
+            float* d_newreach = arena_alloc((size_t)nact * B * nc);   // nc == on here
+            g_row_mul_all<<<blocks_for((size_t)nact * B * nc, T), T, 0, stream_>>>(d_reach, avg, d_newreach, nc, nact, B);
             for (int a = 0; a < nact; ++a)
-                g_add<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_out, utils + (size_t)a * B * pn, (int)((size_t)B * pn));
+                cfr(player, nd.children[a], d_newreach + (size_t)a * B * nc, utils + (size_t)a * B * pn, true);
+            g_sum_utils<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_out, utils, (int)((size_t)B * pn), nact);
         }
         arena_top_ = mark;
         return;
