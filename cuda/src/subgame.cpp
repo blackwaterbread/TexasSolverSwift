@@ -100,6 +100,41 @@ Subgame load_subgame(const std::string& path) {
                 std::istringstream rs(line);
                 for (int i = 0; i < ndr; i++) rs >> sg.iso_riverperm[(size_t)d * ndr + i];
             }
+        } else if (tag == "rivoff") {
+            ss >> sg.riv_nt;
+            sg.riv_off.resize(sg.riv_nt + 1);
+            std::getline(in, line);
+            std::istringstream rs(line);
+            for (int i = 0; i <= sg.riv_nt; i++) rs >> sg.riv_off[i];
+            sg.riv_iso_on = true;
+        } else if (tag == "rivrepcards") {
+            int n; ss >> n;
+            sg.riv_rep_cards.resize(n);
+            std::getline(in, line);
+            std::istringstream rs(line);
+            for (int i = 0; i < n; i++) rs >> sg.riv_rep_cards[i];
+        } else if (tag == "rivslot2turn") {
+            int n; ss >> n;
+            sg.riv_slot2turn.resize(n);
+            std::getline(in, line);
+            std::istringstream rs(line);
+            for (int i = 0; i < n; i++) rs >> sg.riv_slot2turn[i];
+        } else if (tag == "rivfullslot") {
+            int nt, nd; ss >> nt >> nd;
+            sg.riv_fullslot.resize((size_t)nt * nd);
+            for (int t = 0; t < nt; t++) {
+                std::getline(in, line);
+                std::istringstream rs(line);
+                for (int r = 0; r < nd; r++) rs >> sg.riv_fullslot[(size_t)t * nd + r];
+            }
+        } else if (tag == "rivperm") {
+            int player, nrow, nc; ss >> player >> nrow >> nc;
+            sg.riv_perm[player].resize((size_t)nrow * nc);
+            for (int row = 0; row < nrow; row++) {
+                std::getline(in, line);
+                std::istringstream rs(line);
+                for (int i = 0; i < nc; i++) rs >> sg.riv_perm[player][(size_t)row * nc + i];
+            }
         } else if (tag == "nnodes") {
             int n; ss >> n;
             sg.nodes.resize(n);

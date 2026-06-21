@@ -225,12 +225,19 @@ __global__ void g_sd_eval_b(const int* prk, int pn, const float* pref, const int
 __global__ void g_terminal_b(const int* pc1, const int* pc2, int pn,
                              const int* oc1, const int* oc2, const float* reach, int on,
                              float payoff, const int* lvl1cards, int nd1, const int* lvl2cards, int nd2,
-                             int level, float* out, int B) {
+                             int level, float* out, int B,
+                             int riv_iso, const int* slot2turn, const int* rivrepcards) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= B * pn) return;
     int b = t / pn, i = t % pn;
     int a1 = pc1[i], a2 = pc2[i];
-    if (level > 0) {
+    if (riv_iso && level == 2) {
+        // Ragged level-2: batch b is an absolute river-rep slot. Exclude hands hitting
+        // either the turn-rep card (lvl1cards[slot2turn[b]]) or the river-rep card.
+        int tcard = lvl1cards[slot2turn[b]];
+        int rcard = rivrepcards[b];
+        if (a1 == tcard || a2 == tcard || a1 == rcard || a2 == rcard) { out[t] = 0.0f; return; }
+    } else if (level > 0) {
         int x = b;
         for (int L = level; L >= 1; --L) {       // deepest (river) digit first
             int rad = (L == 2) ? nd2 : nd1;
@@ -297,6 +304,44 @@ __global__ void g_chance_reduce_iso(const float* util, float* out, int pn, int N
     float s = 0.0f;
     for (int c = 0; c < nd_full; ++c)
         s += util[((size_t)b_in * ND_iso + rep_slot[c]) * pn + perm[(size_t)c * pn + i]];
+    out[t] = s;
+}
+
+// Full 2-level iso (flop) level-2 chance EXPAND. The reach entering is one row per
+// turn rep (Bin = NT). Output is one row per absolute river-rep slot: slot's owning
+// turn rep tr = slot2turn[slot] supplies the parent reach, masked when the river-rep
+// card collides with the opponent hand and scaled by 1/possible_deals (the turn-rep
+// card never repeats a river rep). Output index == slot*on+h is contiguous because
+// slots are ordered by turn rep then river rep (prefix offsets).
+__global__ void g_chance_expand_riv2(const float* reach, float* out, const int* oc1, const int* oc2,
+                                     const int* slot2turn, const int* rivrepcards, int on, int total, float inv) {
+    size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (size_t)total * on) return;
+    int h = (int)(t % on);
+    int slot = (int)(t / on);
+    int tr = slot2turn[slot];
+    int card_r = rivrepcards[slot];
+    bool bad = (oc1[h] == card_r || oc2[h] == card_r);
+    out[t] = bad ? 0.0f : reach[(size_t)tr * on + h] * inv;
+}
+
+// Full 2-level iso (flop) level-2 chance REDUCE. Sum each turn rep's full rivers,
+// reading the river-rep utility relabeled by the per-(turn rep, full river) hand
+// permutation. fullslot[tr*ND + r] is the abs river-rep slot (-1 when river r is the
+// turn-rep card). Output is one row per turn rep (Bin = NT), feeding the level-1
+// turn reduce. Mirrors the CPU iso scheme one level deeper.
+__global__ void g_chance_reduce_riv2(const float* util, float* out, int pn, int NT, int ND,
+                                     const int* fullslot, const int* perm) {
+    size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (size_t)NT * pn) return;
+    int i = (int)(t % pn), tr = (int)(t / pn);
+    float s = 0.0f;
+    for (int r = 0; r < ND; ++r) {
+        int slot = fullslot[(size_t)tr * ND + r];
+        if (slot < 0) continue;
+        int ph = perm[((size_t)tr * ND + r) * pn + i];
+        s += util[(size_t)slot * pn + ph];
+    }
     out[t] = s;
 }
 
@@ -437,10 +482,12 @@ int CudaCfrSolver::level(int nodeid) const {
 // count at that depth. Mixed radix so flop iso (turn reduced, river full) works; for
 // the uniform case nd_lvl1_==nd_lvl2_==ND, reproducing ND^lvl.
 int CudaCfrSolver::Bprod(int lvl) const {
-    int b = 1;
-    if (lvl >= 1) b *= nd_lvl1_;
-    if (lvl >= 2) b *= nd_lvl2_;
-    return b;
+    if (lvl <= 0) return 1;
+    if (lvl == 1) return nd_lvl1_;
+    // lvl >= 2: with full-2 iso the river level is ragged, so the level-2 batch is
+    // the total river-rep slot count (not a rectangular nd_lvl1_*nd_lvl2_ product).
+    if (riv_iso_on_) return riv_total_;
+    return nd_lvl1_ * nd_lvl2_;
 }
 
 // Trainable sets at an action node = one per compound runout reaching it.
@@ -521,6 +568,27 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
             nd_lvl1_ = (int)sg.iso_level1_cards.size();
             cudaMalloc(&d_lvl1cards_, (size_t)nd_lvl1_ * sizeof(int));
             cudaMemcpy(d_lvl1cards_, sg.iso_level1_cards.data(), (size_t)nd_lvl1_ * sizeof(int), cudaMemcpyHostToDevice);
+        }
+    }
+
+    // Full 2-level iso (flop): ragged per-turn-rep river reps. The turn level keeps
+    // its reduction (d_lvl1cards_ = turn reps above); here the river level batch is
+    // riv_total_ slots and the level-2 chance uses the ragged expand/reduce kernels.
+    if (sg.riv_iso_on) {
+        riv_iso_on_ = true;
+        riv_nt_ = sg.riv_nt;
+        riv_total_ = sg.riv_total();
+        d_riv_rep_cards_ = (int*)dmalloc((size_t)riv_total_ * sizeof(int), "riv rep cards");
+        cudaMemcpy(d_riv_rep_cards_, sg.riv_rep_cards.data(), (size_t)riv_total_ * sizeof(int), cudaMemcpyHostToDevice);
+        d_riv_slot2turn_ = (int*)dmalloc((size_t)riv_total_ * sizeof(int), "riv slot2turn");
+        cudaMemcpy(d_riv_slot2turn_, sg.riv_slot2turn.data(), (size_t)riv_total_ * sizeof(int), cudaMemcpyHostToDevice);
+        size_t fs = sg.riv_fullslot.size();
+        d_riv_fullslot_ = (int*)dmalloc(fs * sizeof(int), "riv fullslot");
+        cudaMemcpy(d_riv_fullslot_, sg.riv_fullslot.data(), fs * sizeof(int), cudaMemcpyHostToDevice);
+        for (int p = 0; p < 2; p++) {
+            size_t sz = sg.riv_perm[p].size();
+            d_riv_perm_[p] = (int*)dmalloc(sz * sizeof(int), "riv perm");
+            cudaMemcpy(d_riv_perm_[p], sg.riv_perm[p].data(), sz * sizeof(int), cudaMemcpyHostToDevice);
         }
     }
 
@@ -622,6 +690,10 @@ CudaCfrSolver::~CudaCfrSolver() {
     if (d_lvl1cards_ && d_lvl1cards_ != d_deal_cards_) cudaFree(d_lvl1cards_);   // owned only for flop iso
     if (d_iso_rep_slot_) cudaFree(d_iso_rep_slot_);
     for (int p = 0; p < 2; p++) if (d_iso_perm_[p]) cudaFree(d_iso_perm_[p]);
+    if (d_riv_rep_cards_) cudaFree(d_riv_rep_cards_);
+    if (d_riv_slot2turn_) cudaFree(d_riv_slot2turn_);
+    if (d_riv_fullslot_) cudaFree(d_riv_fullslot_);
+    for (int p = 0; p < 2; p++) if (d_riv_perm_[p]) cudaFree(d_riv_perm_[p]);
     for (int O = 0; O < 2; ++O) {
         cudaFree(d_rankorder_[O]); cudaFree(d_sortedranks_[O]);
         cudaFree(d_cardoff_[O]); cudaFree(d_cardidx_[O]);
@@ -699,17 +771,36 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
         float payoff = (float)nd.pay[player];
         g_terminal_b<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_c1_[player], d_c2_[player], pn,
                                                            d_c1_[1 - player], d_c2_[1 - player], d_reach, on,
-                                                           payoff, d_lvl1cards_, nd_lvl1_, d_lvl2cards_, nd_lvl2_, lvl, d_out, B);
+                                                           payoff, d_lvl1cards_, nd_lvl1_, d_lvl2cards_, nd_lvl2_, lvl, d_out, B,
+                                                           riv_iso_on_ ? 1 : 0, d_riv_slot2turn_, d_riv_rep_cards_);
         return;
     }
     if (nd.type == NT_CHANCE) {
         int child = nd.children[0];
         int out_level = lvl;                  // chance node's round = the round it deals into
         int in_level = out_level - 1;
-        int nd_cur = (out_level >= 2) ? nd_lvl2_ : nd_lvl1_;          // deals at this level
-        const int* curcards = (out_level >= 2) ? d_lvl2cards_ : d_lvl1cards_;
         int Bin = Bprod(in_level);            // batch entering the chance
         float inv = 1.0f / (float)sg_.possible_deals[out_level - 1];
+
+        // Full-2 iso: the level-2 (river) chance is ragged. Expand the NT turn-rep
+        // reaches into riv_total_ river-rep slots, recurse once, then reduce each turn
+        // rep's full rivers back via the per-rep hand permutation.
+        if (riv_iso_on_ && out_level == 2) {
+            size_t mark2 = arena_top_;
+            float* d_nr2 = arena_alloc((size_t)riv_total_ * on);
+            g_chance_expand_riv2<<<blocks_for((size_t)riv_total_ * on, T), T, 0, stream_>>>(
+                d_reach, d_nr2, d_c1_[1 - player], d_c2_[1 - player],
+                d_riv_slot2turn_, d_riv_rep_cards_, on, riv_total_, inv);
+            float* d_cu2 = arena_alloc((size_t)riv_total_ * pn);
+            cfr(player, child, d_nr2, d_cu2, br);     // B = riv_total_
+            g_chance_reduce_riv2<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(
+                d_cu2, d_out, pn, Bin, ND_, d_riv_fullslot_, d_riv_perm_[player]);
+            arena_top_ = mark2;
+            return;
+        }
+
+        int nd_cur = (out_level >= 2) ? nd_lvl2_ : nd_lvl1_;          // deals at this level
+        const int* curcards = (out_level >= 2) ? d_lvl2cards_ : d_lvl1cards_;
         size_t mark = arena_top_;
         float* d_nr = arena_alloc((size_t)Bin * nd_cur * on);
         g_chance_expand<<<blocks_for((size_t)Bin * nd_cur * on, T), T, 0, stream_>>>(d_reach, d_nr,

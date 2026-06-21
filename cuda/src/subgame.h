@@ -75,6 +75,21 @@ struct Subgame {
     // card's suit swap (row = full turn card, col = river index -> remapped index).
     std::vector<int> iso_riverperm;
 
+    // Full 2-level iso (flop only). When on, the river level is reduced per turn rep
+    // (RAGGED): turn rep t owns river-rep slots [riv_off[t], riv_off[t+1]). `deals`/
+    // dealrank index the absolute river-rep slot. riv_rep_cards[slot]/riv_slot2turn
+    // [slot] describe each slot; riv_fullslot[t*ND + r] maps (turn rep t, full river
+    // index r) -> abs slot (-1 if r == turn-rep card); riv_perm[player][(t*ND+r)*nc +
+    // h] relabels full-river hand h onto its river rep's hand (suit-swap permutation).
+    bool riv_iso_on = false;
+    std::vector<int> riv_off;             // [NT+1] prefix offsets (NT = turn reps)
+    std::vector<int> riv_rep_cards;       // [total] river rep card int per abs slot
+    std::vector<int> riv_slot2turn;       // [total] turn rep index per abs slot
+    std::vector<int> riv_fullslot;        // [NT * ND] abs river-rep slot (or -1)
+    std::vector<int> riv_perm[2];         // [NT * ND * ncombos(player)]
+    int riv_nt = 0;                       // turn rep count (NT)
+    int riv_total() const { return riv_off.empty() ? 0 : riv_off.back(); }
+
     int ncombos(int player) const { return (int)ranges[player].size(); }
     int ndeals() const { return (int)deal_cards.size(); }
 };

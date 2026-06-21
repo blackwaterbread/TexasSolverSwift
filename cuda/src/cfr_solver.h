@@ -56,6 +56,19 @@ private:
     int* d_iso_rep_slot_ = nullptr;             // [nd_full] representative slot per full deal
     int* d_iso_perm_[2] = {nullptr, nullptr};   // [nd_full * ncards_[player]] hand permutation
 
+    // Full 2-level iso (flop): the river level is reduced per turn rep (RAGGED). The
+    // level-2 batch is riv_total_ absolute river-rep slots (sum over turn reps of
+    // their river-rep counts); turn rep t owns slots given by the host-side offsets.
+    // The level-2 chance expands the NT turn-rep reaches into these slots and reduces
+    // them back by summing each turn rep's full rivers via the per-rep hand perm.
+    bool riv_iso_on_ = false;
+    int riv_nt_ = 0;                             // turn rep count (NT) = Bin at level 2
+    int riv_total_ = 0;                          // total river-rep slots (level-2 batch)
+    int* d_riv_rep_cards_ = nullptr;            // [riv_total_] river rep card per abs slot
+    int* d_riv_slot2turn_ = nullptr;            // [riv_total_] turn rep index per abs slot
+    int* d_riv_fullslot_ = nullptr;             // [NT * ND] (turn rep, full river) -> abs slot
+    int* d_riv_perm_[2] = {nullptr, nullptr};   // [NT * ND * ncards_[player]] hand relabel
+
     // Per-chance-level deal sets (mixed radix; at most 2 levels: flop deals turn then
     // river). nd_lvl1_/nd_lvl2_ are the deal counts and d_lvl1cards_/d_lvl2cards_ the
     // card ints at each level. Uniform (no iso): every level is the full deal set, so

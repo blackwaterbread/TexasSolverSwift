@@ -228,6 +228,16 @@ int main(int argc, const char** argv) {
     vector<int> rep_slot_full(ND, 0);       // [ND] representative slot per full deal
     vector<vector<int>> iso_perm[2];        // [player][full deal] -> permuted hand idx
     vector<vector<int>> iso_rivperm;        // flop only: [full turn] -> river index swap
+    // Full 2-level iso (flop only): river iso is recomputed inside each turn rep's
+    // frame (board = flop + turn-rep card), giving a RAGGED set of river reps per
+    // turn rep. Everything below is in turn-rep frame, indexed by deal_cards (valid
+    // when deal_cards[r] != turn-rep card).
+    bool riv_iso_on = false;
+    vector<int> riv_off;                     // [NT+1] prefix offsets into the flat river-rep dim
+    vector<int> riv_rep_cards;               // [total] river rep card int per absolute slot
+    vector<int> riv_slot2turn;               // [total] turn rep index per absolute slot
+    vector<vector<int>> riv_fullslot;        // [NT][ND] abs river-rep slot (-1 if r==turn card)
+    vector<int> riv_perm_flat[2];            // [NT*ND*nc] full-river hand -> river-rep hand
     if (chance_levels >= 1) {
         int color_hash[4] = {0, 0, 0, 0};   // ranks present on board per suit
         for (int bc : board_ints) color_hash[bc % 4] |= (1 << (bc / 4));
@@ -296,6 +306,101 @@ int main(int argc, const char** argv) {
                 iso_rivperm[t].resize(ND);
                 for (int r = 0; r < ND; r++) iso_rivperm[t][r] = cardint_fullidx[sw(deal_cards[r])];
             }
+        }
+
+        // Full 2-level: river iso inside each turn rep's frame. For turn rep t (card
+        // ct = reps[t]) recompute the suit classes of board+ct, collapse equivalent
+        // river cards to representatives, and record a per-(turn rep, full river) rep
+        // slot + hand permutation. The result is ragged (river-rep count varies by
+        // turn rep: a turn card that breaks a flop suit symmetry leaves the river with
+        // fewer/no equivalences). Indexed by deal_cards in turn-rep frame (the river
+        // dealt below turn rep t ranges over deck-flop-ct = deal_cards minus {ct}).
+        if (iso_on && chance_levels == 2) {
+            int NT = nd_iso;
+            // per-player hand index map (sorted_key -> combo index), reused per turn rep.
+            unordered_map<int, int> pidx[2];
+            for (int p = 0; p < 2; p++)
+                for (int i = 0; i < (int)ranges[p].size(); i++)
+                    pidx[p][sorted_key(ranges[p][i].card1, ranges[p][i].card2)] = i;
+            riv_off.assign(NT + 1, 0);
+            riv_fullslot.assign(NT, vector<int>(ND, -1));
+            for (int p = 0; p < 2; p++) riv_perm_flat[p].assign((size_t)NT * ND * ranges[p].size(), 0);
+            int counter = 0;
+            for (int t = 0; t < NT; t++) {
+                int ct = reps[t];
+                int ch2[4]; for (int s = 0; s < 4; s++) ch2[s] = color_hash[s];
+                ch2[ct % 4] |= (1 << (ct / 4));
+                int uf2[4] = {0, 1, 2, 3};
+                function<int(int)> find2 = [&](int x) { return uf2[x] == x ? x : uf2[x] = find2(uf2[x]); };
+                if (!no_iso)
+                    for (int a = 0; a < 4; a++)
+                        for (int b = a + 1; b < 4; b++)
+                            if (ch2[a] == ch2[b] && range_invariant(a, b, range0) && range_invariant(a, b, range1)) {
+                                int ra = find2(a), rb = find2(b);
+                                uf2[ra > rb ? ra : rb] = (ra < rb ? ra : rb);
+                            }
+                int canon2[4];
+                for (int s = 0; s < 4; s++) { canon2[s] = s; for (int j = 0; j < s; j++) if (find2(j) == find2(s)) { canon2[s] = canon2[j]; break; } }
+                // assign absolute slots for this turn rep's river representatives
+                riv_off[t] = counter;
+                unordered_map<int, int> repcard_slot2;     // river rep card int -> abs slot
+                for (int r = 0; r < ND; r++) {
+                    int cr = deal_cards[r]; if (cr == ct) continue;
+                    int s = cr % 4;
+                    if (canon2[s] == s) { repcard_slot2[cr] = counter; riv_rep_cards.push_back(cr); riv_slot2turn.push_back(t); counter++; }
+                }
+                // full-river -> rep slot + per-player hand perm (suit swap s<->canon2[s])
+                for (int r = 0; r < ND; r++) {
+                    int cr = deal_cards[r]; if (cr == ct) { riv_fullslot[t][r] = -1; continue; }
+                    int s = cr % 4, a = std::min(s, canon2[s]), b = std::max(s, canon2[s]);
+                    auto sw = [&](int x) { return x % 4 == a ? x - a + b : (x % 4 == b ? x - b + a : x); };
+                    riv_fullslot[t][r] = repcard_slot2[cr - s + canon2[s]];
+                    for (int p = 0; p < 2; p++) {
+                        size_t base = ((size_t)t * ND + r) * ranges[p].size();
+                        for (int i = 0; i < (int)ranges[p].size(); i++) {
+                            auto it = pidx[p].find(sorted_key(sw(ranges[p][i].card1), sw(ranges[p][i].card2)));
+                            riv_perm_flat[p][base + i] = (it != pidx[p].end()) ? it->second : i;
+                        }
+                    }
+                }
+            }
+            riv_off[NT] = counter;
+            riv_iso_on = true;
+
+            // Composed self-check (equilibrium-independent ground truth): for every full
+            // (turn tf, river rf) the engine/dump maps hand h to the rep trainable via
+            // turn perm then river perm; the completed-board ranks must match. rfp is the
+            // river index in turn rep t's frame (after the turn suit swap, == iso_rivperm).
+            for (int p = 0; p < 2; p++) {
+                int nc = (int)ranges[p].size();
+                for (int tf = 0; tf < ND; tf++) {
+                    int ct = deal_cards[tf], t = rep_slot_full[tf], ctrep = reps[t];
+                    for (int rf = 0; rf < ND; rf++) {
+                        int cr = deal_cards[rf]; if (cr == ct) continue;
+                        int rfp = iso_rivperm[tf][rf];
+                        int slot = riv_fullslot[t][rfp];
+                        int crrep = riv_rep_cards[slot];
+                        uint64_t b5 = board_long | Card::boardInt2long(ct) | Card::boardInt2long(cr);
+                        uint64_t b5r = board_long | Card::boardInt2long(ctrep) | Card::boardInt2long(crrep);
+                        for (int h = 0; h < nc; h++) {
+                            PrivateCards& pc = ranges[p][h];
+                            int rk_c = (pc.card1 == ct || pc.card2 == ct || pc.card1 == cr || pc.card2 == cr)
+                                       ? -1 : compairer.get_rank(pc.toBoardLong(), b5);
+                            int th = iso_perm[p][tf][h];
+                            int ph = riv_perm_flat[p][((size_t)t * ND + rfp) * nc + th];
+                            PrivateCards& pr = ranges[p][ph];
+                            int rk_r = (pr.card1 == ctrep || pr.card2 == ctrep || pr.card1 == crrep || pr.card2 == crrep)
+                                       ? -1 : compairer.get_rank(pr.toBoardLong(), b5r);
+                            if (rk_c != rk_r)
+                                throw runtime_error("flop full-2 iso self-check failed: player " + to_string(p) +
+                                    " turn " + to_string(tf) + " river " + to_string(rf) + " hand " + to_string(h) +
+                                    " (" + to_string(rk_c) + " vs " + to_string(rk_r) + ")");
+                        }
+                    }
+                }
+            }
+            cout << "flop full-2 iso self-check passed: turn " << ND << "->" << NT
+                 << " reps, river reps total " << counter << " (vs full " << NT * ND << ")\n";
         }
 
         // Self-check (equilibrium-independent): hand strengths are suit-permutation
@@ -403,11 +508,13 @@ int main(int argc, const char** argv) {
             out << "\n";
         }
         // Hand ranks at the completed 5-card board, one row per compound runout. Row
-        // index is mixed-radix: turn (1 level) = rep slot; flop = turn_rep*ND + river
-        // (turn over representatives, river full). rank -1 when the combo collides
-        // with a dealt card, or the compound deal repeats a card (impossible runout).
+        // index: turn (1 level) = rep slot; flop level-1 iso = turn_rep*ND + river
+        // (turn reps, river full); flop full-2 iso = the absolute river-rep slot
+        // (board flop + turn-rep card + river-rep card, in riv_slot2turn order). rank
+        // -1 when the combo collides with a dealt card or the runout repeats a card.
         long long nrows = (chance_levels == 1) ? (long long)reps.size()
-                                               : (long long)reps.size() * ND;
+                        : riv_iso_on            ? (long long)riv_off[(int)reps.size()]
+                                                : (long long)reps.size() * ND;
         for (int p = 0; p < 2; p++) {
             out << "dealranks " << p << " " << nrows << " " << ranges[p].size() << "\n";
             if (chance_levels == 1) {
@@ -420,7 +527,19 @@ int main(int argc, const char** argv) {
                     }
                     out << "\n";
                 }
-            } else {  // chance_levels == 2 (flop): turn over reps, river full
+            } else if (riv_iso_on) {  // flop full-2: one row per absolute river-rep slot
+                for (long long slot = 0; slot < nrows; slot++) {
+                    int ct = reps[riv_slot2turn[slot]], cr = riv_rep_cards[slot];
+                    uint64_t b5 = board_long | Card::boardInt2long(ct) | Card::boardInt2long(cr);
+                    for (auto& pc : ranges[p]) {
+                        int rank = (pc.card1 == ct || pc.card2 == ct ||
+                                    pc.card1 == cr || pc.card2 == cr)
+                                   ? -1 : compairer.get_rank(pc.toBoardLong(), b5);
+                        out << rank << " ";
+                    }
+                    out << "\n";
+                }
+            } else {  // chance_levels == 2 (flop), no iso: turn over reps, river full
                 for (int ct : reps) {
                     for (int cr : deal_cards) {
                         if (ct == cr) {  // impossible: same card dealt twice
@@ -470,6 +589,39 @@ int main(int argc, const char** argv) {
                 out << "isorivperm " << ND << " " << ND << "\n";
                 for (int t = 0; t < ND; t++) {
                     for (int r = 0; r < ND; r++) out << iso_rivperm[t][r] << " ";
+                    out << "\n";
+                }
+            }
+        }
+
+        // Full 2-level iso ragged river blocks (flop only). Presence of `rivoff` tells
+        // the engine to use the per-turn-rep ragged river iso path: `deals`/dealranks
+        // above index the absolute river-rep slot, `rivoff` are the prefix offsets per
+        // turn rep, `rivrepcards`/`rivslot2turn` describe each slot, `rivfullslot` maps
+        // (turn rep, full river index) -> abs slot (-1 if river==turn card), and
+        // `rivperm` is the per-player hand relabel for that full river onto its rep.
+        if (riv_iso_on) {
+            int NT = (int)reps.size();
+            int total = riv_off[NT];
+            out << "rivoff " << NT << "\n";
+            for (int t = 0; t <= NT; t++) out << riv_off[t] << " ";
+            out << "\n";
+            out << "rivrepcards " << total << "\n";
+            for (int s = 0; s < total; s++) out << riv_rep_cards[s] << " ";
+            out << "\n";
+            out << "rivslot2turn " << total << "\n";
+            for (int s = 0; s < total; s++) out << riv_slot2turn[s] << " ";
+            out << "\n";
+            out << "rivfullslot " << NT << " " << ND << "\n";
+            for (int t = 0; t < NT; t++) {
+                for (int r = 0; r < ND; r++) out << riv_fullslot[t][r] << " ";
+                out << "\n";
+            }
+            for (int p = 0; p < 2; p++) {
+                out << "rivperm " << p << " " << (long long)NT * ND << " " << ranges[p].size() << "\n";
+                for (long long row = 0; row < (long long)NT * ND; row++) {
+                    size_t base = (size_t)row * ranges[p].size();
+                    for (int i = 0; i < (int)ranges[p].size(); i++) out << riv_perm_flat[p][base + i] << " ";
                     out << "\n";
                 }
             }
