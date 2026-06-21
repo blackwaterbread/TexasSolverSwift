@@ -68,6 +68,23 @@ Subgame load_subgame(const std::string& path) {
                 std::istringstream rs(line);
                 for (int i = 0; i < nc; i++) rs >> sg.dealrank[player][(size_t)d * nc + i];
             }
+        } else if (tag == "iso") {
+            ss >> sg.iso_nd_full;
+            sg.iso_on = true;
+        } else if (tag == "isorepslot") {
+            sg.iso_rep_slot.resize(sg.iso_nd_full);
+            for (int i = 0; i < sg.iso_nd_full; i++) ss >> sg.iso_rep_slot[i];
+        } else if (tag == "isolabels") {
+            sg.iso_labels.resize(sg.iso_nd_full);
+            for (int i = 0; i < sg.iso_nd_full; i++) ss >> sg.iso_labels[i];
+        } else if (tag == "isoperm") {
+            int player, nd, nc; ss >> player >> nd >> nc;
+            sg.iso_perm[player].resize((size_t)nd * nc);
+            for (int d = 0; d < nd; d++) {
+                std::getline(in, line);
+                std::istringstream rs(line);
+                for (int i = 0; i < nc; i++) rs >> sg.iso_perm[player][(size_t)d * nc + i];
+            }
         } else if (tag == "nnodes") {
             int n; ss >> n;
             sg.nodes.resize(n);

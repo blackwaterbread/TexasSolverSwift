@@ -274,6 +274,22 @@ __global__ void g_chance_reduce(const float* util, float* out, int pn, int ND, i
     out[t] = s;
 }
 
+// Chance reduce with suit isomorphism. The children hold only the ND_iso
+// representative runouts; re-expand to all nd_full real runouts by, for each full
+// card c, reading representative slot rep_slot[c] with this player's hands relabeled
+// by the suit permutation perm[c*pn + i]. Mirrors the CPU iso scheme (representative
+// utility recovered for each equivalent runout via exchange_color, then summed).
+__global__ void g_chance_reduce_iso(const float* util, float* out, int pn, int ND_iso, int Bin,
+                                    int nd_full, const int* rep_slot, const int* perm) {
+    size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (size_t)Bin * pn) return;
+    int i = t % pn, b_in = (int)(t / pn);
+    float s = 0.0f;
+    for (int c = 0; c < nd_full; ++c)
+        s += util[((size_t)b_in * ND_iso + rep_slot[c]) * pn + perm[(size_t)c * pn + i]];
+    out[t] = s;
+}
+
 // rplus/cum are stored as fp16 (half the memory) but all math is done in fp32,
 // mirroring the CPU DiscountedCfrTrainableHF mode (storage half, compute float).
 __global__ void g_curr_strat_b(const __half* rplus, float* strat, int nact, int nc, int B) {
@@ -457,6 +473,19 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
         cudaMemcpy(d_deal_cards_, sg.deal_cards.data(), sz * sizeof(int), cudaMemcpyHostToDevice);
     }
 
+    // Suit isomorphism tables (turn): rep slot per full deal + per-player hand perm.
+    if (sg.iso_on) {
+        iso_on_ = true;
+        iso_nd_full_ = sg.iso_nd_full;
+        cudaMalloc(&d_iso_rep_slot_, (size_t)iso_nd_full_ * sizeof(int));
+        cudaMemcpy(d_iso_rep_slot_, sg.iso_rep_slot.data(), (size_t)iso_nd_full_ * sizeof(int), cudaMemcpyHostToDevice);
+        for (int p = 0; p < 2; p++) {
+            size_t sz = sg.iso_perm[p].size();
+            cudaMalloc(&d_iso_perm_[p], sz * sizeof(int));
+            cudaMemcpy(d_iso_perm_[p], sg.iso_perm[p].data(), sz * sizeof(int), cudaMemcpyHostToDevice);
+        }
+    }
+
     // O(n) showdown structures (used only for the no-chance river case, B==1):
     // rank-sorted order + per-card CSR over base ranks, built once per range side.
     for (int O = 0; O < 2; ++O) {
@@ -552,6 +581,8 @@ CudaCfrSolver::~CudaCfrSolver() {
         if (d_dealrank_[p]) cudaFree(d_dealrank_[p]);
     }
     if (d_deal_cards_) cudaFree(d_deal_cards_);
+    if (d_iso_rep_slot_) cudaFree(d_iso_rep_slot_);
+    for (int p = 0; p < 2; p++) if (d_iso_perm_[p]) cudaFree(d_iso_perm_[p]);
     for (int O = 0; O < 2; ++O) {
         cudaFree(d_rankorder_[O]); cudaFree(d_sortedranks_[O]);
         cudaFree(d_cardoff_[O]); cudaFree(d_cardidx_[O]);
@@ -645,7 +676,11 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
                         d_c1_[1 - player], d_c2_[1 - player], d_deal_cards_, ND_, in_level, on, Bin, inv);
         float* d_cu = arena_alloc((size_t)Bin * ND_ * pn);
         cfr(player, child, d_nr, d_cu, br);       // child one level deeper => B=Bin*ND
-        g_chance_reduce<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(d_cu, d_out, pn, ND_, Bin);
+        if (iso_on_)
+            g_chance_reduce_iso<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(
+                d_cu, d_out, pn, ND_, Bin, iso_nd_full_, d_iso_rep_slot_, d_iso_perm_[player]);
+        else
+            g_chance_reduce<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(d_cu, d_out, pn, ND_, Bin);
         arena_top_ = mark;
         return;
     }

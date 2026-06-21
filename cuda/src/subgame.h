@@ -55,6 +55,19 @@ struct Subgame {
     // collides with a dealt card, or the compound deal repeats a card (impossible).
     std::vector<int> dealrank[2];
 
+    // Suit isomorphism (turn subgame only, single chance level). When on, deal_cards
+    // / dealrank above hold only the iso representatives (nd_iso = ndeals()); the
+    // chance node deals representatives and the reduce re-expands to all iso_nd_full
+    // runouts. iso_rep_slot[c] gives the representative slot (0..nd_iso-1) for full
+    // deal c, and iso_perm[player][c*nc + h] maps full deal c's hand h onto the
+    // representative's hand (the suit-swap permutation). iso_labels[c] is the full
+    // runout's card label, used to key the expanded dump. Empty when off.
+    bool iso_on = false;
+    int iso_nd_full = 0;
+    std::vector<int> iso_rep_slot;            // [nd_full]
+    std::vector<std::string> iso_labels;      // [nd_full]
+    std::vector<int> iso_perm[2];             // [nd_full * ncombos(player)]
+
     int ncombos(int player) const { return (int)ranges[player].size(); }
     int ndeals() const { return (int)deal_cards.size(); }
 };

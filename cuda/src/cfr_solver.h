@@ -48,6 +48,14 @@ private:
     int root_round_ = 3;
     int ND_ = 1;                                // deal-card count (max(1, ndeals))
 
+    // Suit isomorphism (turn subgame). When on, ND_ holds the representative count;
+    // the chance node deals representatives and g_chance_reduce_iso re-expands to all
+    // iso_nd_full_ real runouts via the per-player hand permutation. Off => plain reduce.
+    bool iso_on_ = false;
+    int iso_nd_full_ = 0;
+    int* d_iso_rep_slot_ = nullptr;             // [nd_full] representative slot per full deal
+    int* d_iso_perm_[2] = {nullptr, nullptr};   // [nd_full * ncards_[player]] hand permutation
+
     // per action-node persistent device state (fp16 storage / fp32 compute, like
     // the CPU HF trainable; halves the dominant trainable memory). null if non-action.
     std::vector<__half*> d_rplus_;

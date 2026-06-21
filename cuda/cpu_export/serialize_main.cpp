@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <memory>
 #include <functional>
+#include <algorithm>
 
 #include "include/library.h"
 #include "include/Card.h"
@@ -71,11 +72,13 @@ int main(int argc, const char** argv) {
     parser.addArgument("-i", "--input_file", 1, true);
     parser.addArgument("-r", "--resource_dir", 1, true);
     parser.addArgument("-o", "--out_file", 1, true);
+    parser.addArgument("--no_iso", 1, true);          // "1" disables suit isomorphism (full deals; for A/B benchmarking)
     parser.parse(argc, argv);
 
     string input_file = parser.retrieve<string>("input_file");
     string resource_dir = parser.retrieve<string>("resource_dir");
     string out_file = parser.retrieve<string>("out_file");
+    bool no_iso = parser.retrieve<string>("no_iso") == "1";
     if (resource_dir.empty()) resource_dir = "./resources";
     if (out_file.empty()) out_file = "subgame.txt";
 
@@ -210,6 +213,101 @@ int main(int argc, const char** argv) {
     vector<int> pdeals;
     for (int L = 0; L < chance_levels; L++) pdeals.push_back(deck_n - board_n - L - 2);
 
+    // ---- suit isomorphism (turn subgame, single chance level) ----
+    // Two suits are equivalent iff the board carries the same rank-set in both AND
+    // both players' ranges are invariant under swapping them. Equivalent runout
+    // cards (same rank, equivalent suits) collapse to one representative; the GPU
+    // engine trains only representatives and re-expands at the chance reduce via the
+    // suit permutation. Card int = rank*4 + suit, so ci%4 = suit, ci/4 = rank.
+    // Flop (2 levels) keeps the full set for now (multi-level iso is future work).
+    bool iso_on = false;
+    int nd_iso = ND;
+    vector<int> reps;                       // representative card ints (size nd_iso)
+    vector<int> rep_slot_full(ND, 0);       // [ND] representative slot per full deal
+    vector<vector<int>> iso_perm[2];        // [player][full deal] -> permuted hand idx
+    if (chance_levels == 1) {
+        int color_hash[4] = {0, 0, 0, 0};   // ranks present on board per suit
+        for (int bc : board_ints) color_hash[bc % 4] |= (1 << (bc / 4));
+        auto sorted_key = [](int c1, int c2) { if (c1 > c2) std::swap(c1, c2); return c1 * 52 + c2; };
+        auto range_invariant = [&](int a, int b, const vector<PrivateCards>& rg) {
+            unordered_map<int, float> wmap;
+            for (auto& pc : rg) wmap[sorted_key(pc.card1, pc.card2)] = pc.weight;
+            auto sw = [&](int x) { return x % 4 == a ? x - a + b : (x % 4 == b ? x - b + a : x); };
+            for (auto& pc : rg) {
+                auto it = wmap.find(sorted_key(sw(pc.card1), sw(pc.card2)));
+                if (it == wmap.end() || it->second != pc.weight) return false;
+            }
+            return true;
+        };
+        // union-find over the 4 suits; merge equivalent pairs (skipped under --no_iso,
+        // leaving every suit its own class so the full deal set is emitted unchanged).
+        int uf[4] = {0, 1, 2, 3};
+        function<int(int)> find = [&](int x) { return uf[x] == x ? x : uf[x] = find(uf[x]); };
+        if (!no_iso)
+            for (int a = 0; a < 4; a++)
+                for (int b = a + 1; b < 4; b++)
+                    if (color_hash[a] == color_hash[b] &&
+                        range_invariant(a, b, range0) && range_invariant(a, b, range1)) {
+                        int ra = find(a), rb = find(b);
+                        uf[ra > rb ? ra : rb] = (ra < rb ? ra : rb);
+                    }
+        int canon[4];                       // smallest suit index in each class
+        for (int s = 0; s < 4; s++) { canon[s] = s; for (int j = 0; j < s; j++) if (find(j) == find(s)) { canon[s] = canon[j]; break; } }
+
+        unordered_map<int, int> repcard_slot, cardint_fullidx;
+        for (int t = 0; t < ND; t++) cardint_fullidx[deal_cards[t]] = t;
+        for (int t = 0; t < ND; t++) {
+            int c = deal_cards[t], s = c % 4;
+            if (canon[s] == s) { repcard_slot[c] = (int)reps.size(); reps.push_back(c); }
+        }
+        nd_iso = (int)reps.size();
+        for (int t = 0; t < ND; t++) {
+            int c = deal_cards[t], s = c % 4;
+            rep_slot_full[t] = repcard_slot[c - s + canon[s]];
+        }
+        // per-player hand permutation for each full deal (transposition s<->canon[s]).
+        for (int p = 0; p < 2; p++) {
+            unordered_map<int, int> pidx;
+            for (int i = 0; i < (int)ranges[p].size(); i++) pidx[sorted_key(ranges[p][i].card1, ranges[p][i].card2)] = i;
+            iso_perm[p].resize(ND);
+            for (int t = 0; t < ND; t++) {
+                int s = deal_cards[t] % 4, a = std::min(s, canon[s]), b = std::max(s, canon[s]);
+                auto sw = [&](int x) { return x % 4 == a ? x - a + b : (x % 4 == b ? x - b + a : x); };
+                vector<int>& pv = iso_perm[p][t]; pv.resize(ranges[p].size());
+                for (int i = 0; i < (int)ranges[p].size(); i++) {
+                    auto it = pidx.find(sorted_key(sw(ranges[p][i].card1), sw(ranges[p][i].card2)));
+                    pv[i] = (it != pidx.end()) ? it->second : i;
+                }
+            }
+        }
+        iso_on = (nd_iso < ND);
+
+        // Self-check (equilibrium-independent): hand strengths are suit-permutation
+        // invariant, so dealrank at runout c must equal dealrank at its rep with the
+        // hands relabeled by the suit swap. Validates canon + perm before any solve.
+        if (iso_on) {
+            for (int p = 0; p < 2; p++) {
+                for (int t = 0; t < ND; t++) {
+                    int ct = deal_cards[t];
+                    uint64_t bt = board_long | Card::boardInt2long(ct);
+                    int rep_full = cardint_fullidx[reps[rep_slot_full[t]]];
+                    int crep = deal_cards[rep_full];
+                    uint64_t brep = board_long | Card::boardInt2long(crep);
+                    for (int h = 0; h < (int)ranges[p].size(); h++) {
+                        PrivateCards& pc = ranges[p][h];
+                        int rk_c = (pc.card1 == ct || pc.card2 == ct) ? -1 : compairer.get_rank(pc.toBoardLong(), bt);
+                        PrivateCards& pr = ranges[p][iso_perm[p][t][h]];
+                        int rk_r = (pr.card1 == crep || pr.card2 == crep) ? -1 : compairer.get_rank(pr.toBoardLong(), brep);
+                        if (rk_c != rk_r)
+                            throw runtime_error("iso self-check failed: player " + to_string(p) + " deal " + to_string(t) +
+                                                " hand " + to_string(h) + " (" + to_string(rk_c) + " vs " + to_string(rk_r) + ")");
+                    }
+                }
+            }
+            cout << "iso self-check passed: ND " << ND << " -> " << nd_iso << " representatives\n";
+        }
+    }
+
     // ---- write ----
     ofstream out(out_file);
     out.precision(9);
@@ -230,26 +328,30 @@ int main(int argc, const char** argv) {
     }
 
     // ---- chance data (turn/flop subgames; river dealt by chance node(s)) ----
+    // For the turn (1 level) the engine deals only the iso representatives (nd_iso);
+    // the chance reduce re-expands to all ND cards via the iso block below. For the
+    // flop (2 levels) iso is not applied yet, so reps == all deal cards (nd_iso==ND).
     if (has_chance) {
-        out << "chancelevels " << chance_levels << " " << ND << "\n";
+        const vector<int>& emit_deals = (chance_levels == 1) ? reps : deal_cards;
+        int nd_eff = (int)emit_deals.size();
+        out << "chancelevels " << chance_levels << " " << nd_eff << "\n";
         out << "pdeals";
         for (int v : pdeals) out << " " << v;
         out << "\n";
-        out << "deals " << ND << "\n";
-        for (int ci : deal_cards) out << ci << " ";
+        out << "deals " << nd_eff << "\n";
+        for (int ci : emit_deals) out << ci << " ";
         out << "\n";
-        for (int ci : deal_cards) out << Card::intCard2Str(ci) << " ";
+        for (int ci : emit_deals) out << Card::intCard2Str(ci) << " ";
         out << "\n";
         // Hand ranks at the completed 5-card board, one row per compound runout.
-        // Row index is the base-ND compound deal: turn (1 level) or turn*ND+river
-        // (2 levels). rank -1 when the combo collides with a dealt card, or the
-        // compound deal repeats a card (impossible runout).
-        long long nrows = 1; for (int L = 0; L < chance_levels; L++) nrows *= ND;
+        // Row index is the base-nd_eff compound deal: turn (1 level, rep cards) or
+        // turn*ND+river (2 levels). rank -1 when the combo collides with a dealt
+        // card, or the compound deal repeats a card (impossible runout).
+        long long nrows = 1; for (int L = 0; L < chance_levels; L++) nrows *= nd_eff;
         for (int p = 0; p < 2; p++) {
             out << "dealranks " << p << " " << nrows << " " << ranges[p].size() << "\n";
             if (chance_levels == 1) {
-                for (int t = 0; t < ND; t++) {
-                    int ct = deal_cards[t];
+                for (int ct : emit_deals) {
                     uint64_t b5 = board_long | Card::boardInt2long(ct);
                     for (auto& pc : ranges[p]) {
                         int rank = (pc.card1 == ct || pc.card2 == ct)
@@ -277,6 +379,27 @@ int main(int argc, const char** argv) {
                         }
                         out << "\n";
                     }
+                }
+            }
+        }
+
+        // iso block: full runout count, each full deal's representative slot, the
+        // full runout labels (for dump keys), and the per-player hand permutation
+        // mapping each full deal's hands onto its representative's hands. Present
+        // only when the turn board actually reduces (nd_iso < ND).
+        if (iso_on) {
+            out << "iso " << ND << "\n";
+            out << "isorepslot";
+            for (int t = 0; t < ND; t++) out << " " << rep_slot_full[t];
+            out << "\n";
+            out << "isolabels";
+            for (int ci : deal_cards) out << " " << Card::intCard2Str(ci);
+            out << "\n";
+            for (int p = 0; p < 2; p++) {
+                out << "isoperm " << p << " " << ND << " " << ranges[p].size() << "\n";
+                for (int t = 0; t < ND; t++) {
+                    for (int h = 0; h < (int)ranges[p].size(); h++) out << iso_perm[p][t][h] << " ";
+                    out << "\n";
                 }
             }
         }
