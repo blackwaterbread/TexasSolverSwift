@@ -56,6 +56,16 @@ private:
     int* d_iso_rep_slot_ = nullptr;             // [nd_full] representative slot per full deal
     int* d_iso_perm_[2] = {nullptr, nullptr};   // [nd_full * ncards_[player]] hand permutation
 
+    // Per-chance-level deal sets (mixed radix; at most 2 levels: flop deals turn then
+    // river). nd_lvl1_/nd_lvl2_ are the deal counts and d_lvl1cards_/d_lvl2cards_ the
+    // card ints at each level. Uniform (no iso): every level is the full deal set, so
+    // Bprod reproduces the old ND^level batching. With turn iso the (single) level is
+    // reduced; with flop level-1 iso the turn level is reduced while river stays full.
+    int nd_lvl1_ = 1, nd_lvl2_ = 0;
+    int* d_lvl1cards_ = nullptr;
+    int* d_lvl2cards_ = nullptr;
+    int Bprod(int lvl) const;                   // product of per-level deal counts for levels 1..lvl
+
     // per action-node persistent device state (fp16 storage / fp32 compute, like
     // the CPU HF trainable; halves the dominant trainable memory). null if non-action.
     std::vector<__half*> d_rplus_;

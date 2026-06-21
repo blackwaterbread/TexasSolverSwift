@@ -218,21 +218,26 @@ __global__ void g_sd_eval_b(const int* prk, int pn, const float* pref, const int
     out[(size_t)b * pn + i] = win * (Wtot - Wc) + lose * (Ltot - Lc);
 }
 
-// Terminal (fold). When level>0, batch b is a base-ND compound deal; peel its
-// `level` digits and exclude player hands colliding with any dealt card.
+// Terminal (fold). When level>0, batch b is a mixed-radix compound deal: digit for
+// the deepest level (river, radix nd2) is least-significant, the shallower level
+// (turn, radix nd1) most-significant. Peel the `level` digits and exclude player
+// hands colliding with any dealt card. (At most 2 chance levels in this solver.)
 __global__ void g_terminal_b(const int* pc1, const int* pc2, int pn,
                              const int* oc1, const int* oc2, const float* reach, int on,
-                             float payoff, const int* deal_cards, int ND, int level, float* out, int B) {
+                             float payoff, const int* lvl1cards, int nd1, const int* lvl2cards, int nd2,
+                             int level, float* out, int B) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= B * pn) return;
     int b = t / pn, i = t % pn;
     int a1 = pc1[i], a2 = pc2[i];
-    if (deal_cards && level > 0) {
+    if (level > 0) {
         int x = b;
-        for (int k = 0; k < level; ++k) {
-            int dc = deal_cards[x % ND];
+        for (int L = level; L >= 1; --L) {       // deepest (river) digit first
+            int rad = (L == 2) ? nd2 : nd1;
+            const int* cards = (L == 2) ? lvl2cards : lvl1cards;
+            int dc = cards[x % rad];
             if (a1 == dc || a2 == dc) { out[t] = 0.0f; return; }
-            x /= ND;
+            x /= rad;
         }
     }
     const float* rb = reach + (size_t)b * on;
@@ -242,24 +247,29 @@ __global__ void g_terminal_b(const int* pc1, const int* pc2, int pn,
     out[t] = payoff * acc;
 }
 
-// Chance expand: reach[Bin*on] -> out[Bin*ND*on], producing one extra deal level.
-// New compound index b_out = b_in*ND + r (output index t == b_out*on + h), so the
-// write is contiguous. Zero a slot when card r repeats a card already dealt along
-// b_in's path (impossible runout) or collides with the opponent hand; else scale
-// the parent reach by 1/possible_deals for this level.
+// Chance expand: reach[Bin*on] -> out[Bin*nd_cur*on], producing one extra deal
+// level. curcards/nd_cur are this level's deal set; b_out = b_in*nd_cur + r (output
+// index t == b_out*on + h), so the write is contiguous. Zero a slot when card r
+// repeats a card already dealt along b_in's path (impossible runout) or collides
+// with the opponent hand; else scale the parent reach by 1/possible_deals. b_in's
+// path digits are the shallower levels (only level 1 exists for in_level<=1).
 __global__ void g_chance_expand(const float* reach, float* out, const int* oc1, const int* oc2,
-                                const int* deal_cards, int ND, int in_level, int on, int Bin, float inv) {
+                                const int* curcards, int nd_cur, const int* lvl1cards, int nd1,
+                                int in_level, int on, int Bin, float inv) {
     size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= (size_t)Bin * ND * on) return;
+    if (t >= (size_t)Bin * nd_cur * on) return;
     int h = t % on;
     size_t rem = t / on;
-    int r = rem % ND;
-    int b_in = (int)(rem / ND);
-    int card_r = deal_cards[r];
+    int r = rem % nd_cur;
+    int b_in = (int)(rem / nd_cur);
+    int card_r = curcards[r];
     bool bad = (oc1[h] == card_r || oc2[h] == card_r);
     if (!bad) {
         int x = b_in;
-        for (int k = 0; k < in_level; ++k) { if (deal_cards[x % ND] == card_r) { bad = true; break; } x /= ND; }
+        for (int L = in_level; L >= 1; --L) {    // path: shallower dealt cards (level 1)
+            if (lvl1cards[x % nd1] == card_r) { bad = true; break; }
+            x /= nd1;
+        }
     }
     out[t] = bad ? 0.0f : reach[(size_t)b_in * on + h] * inv;
 }
@@ -423,9 +433,19 @@ int CudaCfrSolver::level(int nodeid) const {
     return sg_.nodes[nodeid].round - root_round_;
 }
 
-// Trainable sets at an action node = ND^level (one per compound runout reaching it).
+// Product of per-level deal counts for chance levels 1..lvl = the batch B / trainset
+// count at that depth. Mixed radix so flop iso (turn reduced, river full) works; for
+// the uniform case nd_lvl1_==nd_lvl2_==ND, reproducing ND^lvl.
+int CudaCfrSolver::Bprod(int lvl) const {
+    int b = 1;
+    if (lvl >= 1) b *= nd_lvl1_;
+    if (lvl >= 2) b *= nd_lvl2_;
+    return b;
+}
+
+// Trainable sets at an action node = one per compound runout reaching it.
 int CudaCfrSolver::ntrainsets(int nodeid) const {
-    return ipow(ND_, level(nodeid));
+    return Bprod(level(nodeid));
 }
 
 // Checked device allocation: on failure report what failed, how much was needed,
@@ -471,6 +491,16 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
         size_t sz = sg.deal_cards.size();
         cudaMalloc(&d_deal_cards_, sz * sizeof(int));
         cudaMemcpy(d_deal_cards_, sg.deal_cards.data(), sz * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
+    // Per-level deal sets. Default: every level is the full/deepest deal set (uniform
+    // ND^level). The deepest level (river) is always d_deal_cards_; the shallower
+    // turn level is overridden to the reduced representatives below for flop iso.
+    if (sg.has_chance) {
+        nd_lvl1_ = ND_;
+        nd_lvl2_ = (sg.chance_levels >= 2) ? ND_ : 0;
+        d_lvl1cards_ = d_deal_cards_;
+        d_lvl2cards_ = (sg.chance_levels >= 2) ? d_deal_cards_ : nullptr;
     }
 
     // Suit isomorphism tables (turn): rep slot per full deal + per-player hand perm.
@@ -566,7 +596,7 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
     // B = ND^level; the deepest level reaches ND^chance_levels. Peak usage is one
     // root-to-leaf path, tiny vs this floor for the modest test ranges.
     int maxnc = std::max(ncards_[0], ncards_[1]);
-    int maxB = ipow(ND_, sg.chance_levels);
+    int maxB = Bprod(sg.chance_levels);
     size_t need = (size_t)maxnc * 64 * (size_t)maxB;
     arena_cap_ = std::max((size_t)256 * 1024 * 1024 / sizeof(float), need);
     arena_ = (float*)dmalloc(arena_cap_ * sizeof(float), "scratch arena");
@@ -615,7 +645,7 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
     int pn = ncards_[player];                 // util indexed by cfr player's range
     int on = ncards_[1 - player];             // reach indexed by opponent's range
     int lvl = level(nodeid);                  // chance depth (0 above all chances)
-    int B = ipow(ND_, lvl);                   // batch = compound runouts reaching here
+    int B = Bprod(lvl);                       // batch = compound runouts reaching here
     bool use_dealrank = sg_.has_chance && lvl >= 1;
 
     if (nd.type == NT_SHOWDOWN) {
@@ -658,29 +688,32 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
     }
     if (nd.type == NT_TERMINAL) {
         float payoff = (float)nd.pay[player];
-        const int* dc = use_dealrank ? d_deal_cards_ : nullptr;
         g_terminal_b<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_c1_[player], d_c2_[player], pn,
                                                            d_c1_[1 - player], d_c2_[1 - player], d_reach, on,
-                                                           payoff, dc, ND_, lvl, d_out, B);
+                                                           payoff, d_lvl1cards_, nd_lvl1_, d_lvl2cards_, nd_lvl2_, lvl, d_out, B);
         return;
     }
     if (nd.type == NT_CHANCE) {
         int child = nd.children[0];
         int out_level = lvl;                  // chance node's round = the round it deals into
         int in_level = out_level - 1;
-        int Bin = ipow(ND_, in_level);        // batch entering the chance
+        int nd_cur = (out_level >= 2) ? nd_lvl2_ : nd_lvl1_;          // deals at this level
+        const int* curcards = (out_level >= 2) ? d_lvl2cards_ : d_lvl1cards_;
+        int Bin = Bprod(in_level);            // batch entering the chance
         float inv = 1.0f / (float)sg_.possible_deals[out_level - 1];
         size_t mark = arena_top_;
-        float* d_nr = arena_alloc((size_t)Bin * ND_ * on);
-        g_chance_expand<<<blocks_for((size_t)Bin * ND_ * on, T), T, 0, stream_>>>(d_reach, d_nr,
-                        d_c1_[1 - player], d_c2_[1 - player], d_deal_cards_, ND_, in_level, on, Bin, inv);
-        float* d_cu = arena_alloc((size_t)Bin * ND_ * pn);
-        cfr(player, child, d_nr, d_cu, br);       // child one level deeper => B=Bin*ND
-        if (iso_on_)
+        float* d_nr = arena_alloc((size_t)Bin * nd_cur * on);
+        g_chance_expand<<<blocks_for((size_t)Bin * nd_cur * on, T), T, 0, stream_>>>(d_reach, d_nr,
+                        d_c1_[1 - player], d_c2_[1 - player], curcards, nd_cur, d_lvl1cards_, nd_lvl1_, in_level, on, Bin, inv);
+        float* d_cu = arena_alloc((size_t)Bin * nd_cur * pn);
+        cfr(player, child, d_nr, d_cu, br);       // child one level deeper => B=Bin*nd_cur
+        // Level-1 iso: re-expand the reduced reps to all real runouts via the hand
+        // permutation. Deeper levels (river under a flop) stay full -> plain reduce.
+        if (iso_on_ && out_level == 1)
             g_chance_reduce_iso<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(
-                d_cu, d_out, pn, ND_, Bin, iso_nd_full_, d_iso_rep_slot_, d_iso_perm_[player]);
+                d_cu, d_out, pn, nd_cur, Bin, iso_nd_full_, d_iso_rep_slot_, d_iso_perm_[player]);
         else
-            g_chance_reduce<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(d_cu, d_out, pn, ND_, Bin);
+            g_chance_reduce<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(d_cu, d_out, pn, nd_cur, Bin);
         arena_top_ = mark;
         return;
     }
