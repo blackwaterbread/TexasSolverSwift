@@ -1,0 +1,17 @@
+# Build artifacts
+build-mingw/
+cuda/build/
+cuda/cpu_export/build/
+cuda/cpu_export/build_ser/
+cuda/smoke/*.exe
+cuda/smoke/*.exp
+cuda/smoke/*.lib
+*.obj
+
+# Logs
+*.log
+tmp_log.txt
+
+# Generated subgames + goldens (regenerate via SerializeRiver + TexasSolverConsole)
+cuda/configs/subgame*.txt
+cuda/configs/golden_*.json
