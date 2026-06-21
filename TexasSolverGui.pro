@@ -39,15 +39,15 @@ LIBS += -L /usr/local/lib /usr/local/lib/libomp.dylib
 ICON = imgs/texassolver_logo.icns
 }
 
-win32: {
+win32-msvc*: {
 QMAKE_CXXFLAGS+= -openmp
 QMAKE_LFLAGS +=  -openmp
 RC_ICONS = imgs/texassolver_logo.ico
 }
 
-win64: {
-QMAKE_CXXFLAGS+= -openmp
-QMAKE_LFLAGS +=  -openmp
+win32-g++: {
+QMAKE_CXXFLAGS += -fopenmp
+QMAKE_LFLAGS += -fopenmp
 RC_ICONS = imgs/texassolver_logo.ico
 }
 
