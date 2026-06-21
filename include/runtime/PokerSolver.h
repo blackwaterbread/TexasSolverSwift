@@ -47,6 +47,10 @@ public:
             int threads
             );
     void stop();
+    // Builds an in-memory solver from the already-built game tree (no training)
+    // and loads a GPU dump json into its trainables, so the StrategyExplorer can
+    // display GPU results just like CPU ones.
+    void load_gpu_strategy(string p1_range, string p2_range, string boards, string json_path);
     long long estimate_tree_memory(QString range1,QString range2,QString board);
     vector<PrivateCards> player1Range;
     vector<PrivateCards> player2Range;

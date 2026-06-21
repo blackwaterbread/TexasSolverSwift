@@ -493,10 +493,19 @@ void MainWindow::on_solveGpuButton_clicked(){
         });
         connect(slv, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
                 [this, slv, outPath](int scode, QProcess::ExitStatus){
-            if(scode == 0)
+            if(scode == 0){
                 this->ui->logOutput->log_with_signal(tr("GPU solve done. Strategy: ") + outPath);
-            else
+                // Load the GPU result into the in-memory tree so "Show Result"
+                // displays it exactly like a CPU solve (requires Build Tree first).
+                this->qSolverJob->gpu_json_path = outPath.toStdString();
+                this->qSolverJob->range_ip = this->ui->ipRangeText->toPlainText().toStdString();
+                this->qSolverJob->range_oop = this->ui->oopRangeText->toPlainText().toStdString();
+                this->qSolverJob->board = this->ui->boardText->toPlainText().toStdString();
+                this->qSolverJob->current_mission = QSolverJob::MissionType::LOADGPU;
+                this->qSolverJob->start();
+            }else{
                 this->ui->logOutput->log_with_signal(tr("GPU solve failed (exit %1).").arg(scode));
+            }
             slv->deleteLater();
         });
         slv->start(gpuExe, QStringList() << "-s" << subgamePath

@@ -98,6 +98,11 @@ public:
     json dumps(bool with_status,int depth) override;
     vector<vector<vector<float>>> get_strategy(shared_ptr<ActionNode> node,vector<Card> chance_cards) override;
     vector<vector<vector<float>>> get_evs(shared_ptr<ActionNode> node,vector<Card> chance_cards) override;
+    // Loads an average strategy produced by the external GPU engine (dump json
+    // from river_gpu --dump) into this solver's in-memory trainables, so the
+    // StrategyExplorer can display GPU results exactly like CPU ones. Only the
+    // root deal (slot 0) is populated, which fully covers river subgames.
+    void load_gpu_strategy(const string& json_path);
 private:
     vector<vector<PrivateCards>> ranges;
     vector<PrivateCards> range1;

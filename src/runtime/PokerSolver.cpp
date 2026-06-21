@@ -129,6 +129,30 @@ void PokerSolver::train(string p1_range, string p2_range, string boards, string 
     this->solver->train();
 }
 
+void PokerSolver::load_gpu_strategy(string p1_range, string p2_range, string boards, string json_path) {
+    if(this->game_tree == nullptr)
+        throw runtime_error("please build tree first");
+
+    vector<string> board_str_arr = string_split(boards,',');
+    vector<int> initialBoard;
+    for(string one_board_str:board_str_arr){
+        initialBoard.push_back(Card::strCard2int(one_board_str));
+    }
+
+    vector<PrivateCards> range1 = PrivateRangeConverter::rangeStr2Cards(p1_range,initialBoard);
+    vector<PrivateCards> range2 = PrivateRangeConverter::rangeStr2Cards(p2_range,initialBoard);
+
+    // Construct the solver only (no training); force full-float trainables and no
+    // isomorphism so the in-memory tree matches the serialized GPU tree exactly.
+    shared_ptr<PCfrSolver> pcfr = make_shared<PCfrSolver>(
+            game_tree, range1, range2, initialBoard, compairer, deck,
+            0 /*iteration_number*/, false /*debug*/, 1 /*print_interval*/, "" /*logfile*/,
+            "discounted_cfr", Solver::MonteCarolAlg::NONE, -1 /*warmup*/, 0 /*accuracy*/,
+            false /*use_isomorphism*/, 0 /*use_halffloats*/, 1 /*threads*/);
+    pcfr->load_gpu_strategy(json_path);
+    this->solver = pcfr;
+}
+
 void PokerSolver::dump_strategy(QString dump_file,int dump_rounds) {
     //locale &loc=locale::global(locale(locale(),"",LC_CTYPE));
     setlocale(LC_ALL,"");

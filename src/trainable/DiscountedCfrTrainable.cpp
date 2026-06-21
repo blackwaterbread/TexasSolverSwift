@@ -48,6 +48,14 @@ const vector<float> DiscountedCfrTrainable::getAverageStrategy() {
     return average_strategy;
 }
 
+void DiscountedCfrTrainable::setAverageStrategy(const vector<float>& average_strategy) {
+    if(average_strategy.size() != this->cum_r_plus.size())
+        throw runtime_error("size mismatch in DiscountedCfrTrainable setAverageStrategy");
+    // getAverageStrategy() normalizes cum_r_plus per hand, so storing the
+    // (already per-hand-normalized) strategy reproduces it exactly on read-back.
+    this->cum_r_plus.assign(average_strategy.begin(), average_strategy.end());
+}
+
 const vector<float> DiscountedCfrTrainable::getcurrentStrategy() {
     return this->getcurrentStrategyNoCache();
 }

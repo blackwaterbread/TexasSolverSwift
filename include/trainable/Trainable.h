@@ -5,6 +5,7 @@
 #ifndef TEXASSOLVER_TRAINABLE_H
 #define TEXASSOLVER_TRAINABLE_H
 #include <vector>
+#include <stdexcept>
 #include "include/json.hpp"
 using namespace std;
 using json = nlohmann::json;
@@ -16,6 +17,12 @@ public:
         DISCOUNTED_CFR_TRAINABLE
     };
     virtual const vector<float> getAverageStrategy() = 0;
+    // Overwrites the stored average strategy directly (used to inject a strategy
+    // computed externally, e.g. by the GPU engine, for display). Layout matches
+    // getAverageStrategy: action_id * card_number + private_id.
+    virtual void setAverageStrategy(const vector<float>& average_strategy){
+        throw runtime_error("setAverageStrategy not supported for this trainable");
+    }
     virtual const vector<float> getcurrentStrategy() = 0;
     virtual void updateRegrets(const vector<float>& regrets,int iteration_number,const vector<float>& reach_probs) = 0;
     virtual void setEv(const vector<float>& evs) = 0;

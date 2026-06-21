@@ -7,6 +7,8 @@
 #include <QtCore>
 #include <QObject>
 #include <QTranslator>
+#include <fstream>
+#include <functional>
 
 //#define DEBUG;
 
@@ -1174,6 +1176,63 @@ vector<vector<vector<float>>> PCfrSolver::get_evs(shared_ptr<ActionNode> node,ve
         ret_evs[pc.card1][pc.card2] = one_evs;
     }
     return ret_evs;
+}
+
+void PCfrSolver::load_gpu_strategy(const string& json_path){
+    ifstream f(json_path);
+    if(!f) throw runtime_error("cannot open gpu strategy json: " + json_path);
+    json root;
+    f >> root;
+    if(!root.contains("nodes")) throw runtime_error("gpu strategy json has no 'nodes'");
+    json& jnodes = root["nodes"];
+
+    int idx = 0;
+    int injected = 0;
+    bool warned_mismatch = false;
+    // Walk the in-memory tree in the SAME preorder the serializer used to assign
+    // node ids (action: recurse children in order; chance: single child; leaves
+    // still consume an id). Inject the dumped average strategy per action node.
+    std::function<void(shared_ptr<GameTreeNode>)> walk = [&](shared_ptr<GameTreeNode> n){
+        int my_id = idx++;
+        if(n->getType() == GameTreeNode::ACTION){
+            shared_ptr<ActionNode> an = dynamic_pointer_cast<ActionNode>(n);
+            string key = std::to_string(my_id);
+            if(jnodes.contains(key)){
+                json& jn = jnodes[key];
+                int player = an->getPlayer();
+                vector<PrivateCards>& privs = this->ranges[player];
+                int nc = (int)privs.size();
+                int nact = (int)an->getActions().size();
+                // Structural sanity: a mismatch means the in-memory tree and the
+                // serialized one diverged (ids no longer align) -> warn once.
+                if(!warned_mismatch && jn.contains("player") &&
+                   (jn["player"].get<int>() != player ||
+                    (jn.contains("actions") && (int)jn["actions"].size() != nact))){
+                    qDebug().noquote() << QObject::tr("Warning: GPU strategy tree structure mismatch; results may be misaligned.");
+                    warned_mismatch = true;
+                }
+                json& jstrat = jn["strategy"];
+                vector<float> avg((size_t)nact * nc, 0.0f);
+                for(int h = 0; h < nc; h++){
+                    string label = privs[h].toString();
+                    if(!jstrat.contains(label)) continue; // hand absent in dump -> leave 0
+                    json& arr = jstrat[label];
+                    int amax = std::min((int)arr.size(), nact);
+                    for(int a = 0; a < amax; a++) avg[(size_t)a * nc + h] = arr[a].get<float>();
+                }
+                an->getTrainable(0, true, this->use_halffloats)->setAverageStrategy(avg);
+                injected++;
+            }
+            for(auto& c : an->getChildrens()) walk(c);
+        }else if(n->getType() == GameTreeNode::CHANCE){
+            shared_ptr<ChanceNode> cn = dynamic_pointer_cast<ChanceNode>(n);
+            walk(cn->getChildren());
+        }
+        // TERMINAL / SHOWDOWN: leaves, no recursion (id already consumed).
+    };
+    walk(this->tree->getRoot());
+    qDebug().noquote() << QString::fromStdString(
+        tfm::format(QObject::tr("Loaded GPU strategy into %s action nodes.").toStdString().c_str(), injected));
 }
 
 json PCfrSolver::dumps(bool with_status,int depth) {

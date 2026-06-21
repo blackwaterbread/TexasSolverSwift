@@ -29,6 +29,8 @@ void QSolverJob::run()
             this->build_tree();
         }else if(this->current_mission == MissionType::SAVING){
             this->saving();
+        }else if(this->current_mission == MissionType::LOADGPU){
+            this->loadgpu();
         }else{
             throw runtime_error("unsupported mission type");
         }
@@ -83,6 +85,16 @@ void QSolverJob::saving(){
         this->ps_shortdeck.dump_strategy(this->savefile,this->dump_rounds);
     }
     qDebug().noquote() << tr("Saving done.");//.toStdString() << std::endl;
+}
+
+void QSolverJob::loadgpu(){
+    qDebug().noquote() << tr("Loading GPU strategy into tree..");
+    if(this->mode == Mode::HOLDEM){
+        this->ps_holdem.load_gpu_strategy(this->range_ip,this->range_oop,this->board,this->gpu_json_path);
+    }else if(this->mode == Mode::SHORTDECK){
+        this->ps_shortdeck.load_gpu_strategy(this->range_ip,this->range_oop,this->board,this->gpu_json_path);
+    }
+    qDebug().noquote() << tr("GPU strategy loaded. Click \"Show Result\" to view.");
 }
 
 void QSolverJob::stop(){

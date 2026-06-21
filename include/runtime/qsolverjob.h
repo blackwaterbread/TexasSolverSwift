@@ -26,7 +26,8 @@ public:
         LOADING,
         SOLVING,
         BUILDTREE,
-        SAVING
+        SAVING,
+        LOADGPU
     };
     MissionType current_mission = MissionType::LOADING;
     string resource_dir;
@@ -49,6 +50,7 @@ public:
     int use_halffloats=0;
     int print_interval=10;
     int dump_rounds = 2;
+    string gpu_json_path;
     shared_ptr<GameTreeBuildingSettings> gtbs;
 
     PokerSolver* get_solver();
@@ -58,6 +60,7 @@ public:
     void stop();
     void saving();
     void build_tree();
+    void loadgpu();
     long long estimate_tree_memory(QString range1,QString range2,QString board);
     void setContext(QSTextEdit * textEdit);
     QString savefile;
