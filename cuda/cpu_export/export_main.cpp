@@ -33,11 +33,16 @@ int main(int argc, const char** argv) {
 
     CommandLineTool clt = CommandLineTool(mode, resource_dir);
     clt.setGpuOptions(engine, parser.retrieve<string>("serializer"), parser.retrieve<string>("gpu_solver"));
-    if (input_file.empty()) {
-        clt.startWorking();
-    } else {
-        cout << "EXEC FROM FILE: " << input_file << endl;
-        clt.execFromFile(input_file);
+    try {
+        if (input_file.empty()) {
+            clt.startWorking();
+        } else {
+            cout << "EXEC FROM FILE: " << input_file << endl;
+            clt.execFromFile(input_file);
+        }
+    } catch (const std::exception& e) {
+        cout << "ERROR: " << e.what() << endl;
+        return 3;
     }
     return 0;
 }

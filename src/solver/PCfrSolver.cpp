@@ -1189,6 +1189,33 @@ void PCfrSolver::load_gpu_strategy(const string& json_path){
     int idx = 0;
     int injected = 0;
     bool warned_mismatch = false;
+    int card_num = (int)this->deck.getCards().size();
+
+    // Builds the per-hand average-strategy vector (layout action*nc + hand) for an
+    // action node from a json {handlabel:[probs]} map.
+    auto build_avg = [&](json& jstrat, vector<PrivateCards>& privs, int nact, int nc){
+        vector<float> avg((size_t)nact * nc, 0.0f);
+        for(int h = 0; h < nc; h++){
+            string label = privs[h].toString();
+            if(!jstrat.contains(label)) continue; // hand absent in dump -> leave 0
+            json& arr = jstrat[label];
+            int amax = std::min((int)arr.size(), nact);
+            for(int a = 0; a < amax; a++) avg[(size_t)a * nc + h] = arr[a].get<float>();
+        }
+        return avg;
+    };
+
+    // Maps a runout (deck card ints, first dealt first) to the getTrainable() deal
+    // index, mirroring chanceUtility's new_deal recurrence (deck index == cardInt).
+    auto runout2deal = [&](const vector<int>& cards) -> int {
+        int deal = 0;
+        for(int c : cards){
+            if(deal == 0) deal = c + 1;                              // first card dealt
+            else deal = card_num * (deal - 1) + c + 1 + card_num;    // second card dealt
+        }
+        return deal;
+    };
+
     // Walk the in-memory tree in the SAME preorder the serializer used to assign
     // node ids (action: recurse children in order; chance: single child; leaves
     // still consume an id). Inject the dumped average strategy per action node.
@@ -1211,16 +1238,21 @@ void PCfrSolver::load_gpu_strategy(const string& json_path){
                     qDebug().noquote() << QObject::tr("Warning: GPU strategy tree structure mismatch; results may be misaligned.");
                     warned_mismatch = true;
                 }
-                json& jstrat = jn["strategy"];
-                vector<float> avg((size_t)nact * nc, 0.0f);
-                for(int h = 0; h < nc; h++){
-                    string label = privs[h].toString();
-                    if(!jstrat.contains(label)) continue; // hand absent in dump -> leave 0
-                    json& arr = jstrat[label];
-                    int amax = std::min((int)arr.size(), nact);
-                    for(int a = 0; a < amax; a++) avg[(size_t)a * nc + h] = arr[a].get<float>();
+                if(jn.contains("deals")){
+                    // Below chance: one trainset per runout, keyed by card labels.
+                    for(auto it = jn["deals"].begin(); it != jn["deals"].end(); ++it){
+                        vector<string> cstrs = string_split(it.key(), ',');
+                        vector<int> cints;
+                        for(const string& cs : cstrs) cints.push_back(Card::strCard2int(cs));
+                        int deal = runout2deal(cints);
+                        vector<float> avg = build_avg(it.value(), privs, nact, nc);
+                        an->getTrainable(deal, true, this->use_halffloats)->setAverageStrategy(avg);
+                    }
+                }else{
+                    json& jstrat = jn["strategy"];
+                    vector<float> avg = build_avg(jstrat, privs, nact, nc);
+                    an->getTrainable(0, true, this->use_halffloats)->setAverageStrategy(avg);
                 }
-                an->getTrainable(0, true, this->use_halffloats)->setAverageStrategy(avg);
                 injected++;
             }
             for(auto& c : an->getChildrens()) walk(c);

@@ -154,11 +154,6 @@ void CommandLineTool::solveOnGpu() {
         throw runtime_error(tfm::format("GPU solve failed (exit %s)", slv.exitCode()));
 
     this->ps.load_gpu_strategy(this->range_ip, this->range_oop, this->board, jsonPath.toStdString());
-    // On a chance subgame the GPU dump only carries the root street's runout
-    // (slot 0); a deeper dump_result (>=2 rounds) would emit uniform placeholders
-    // for the per-runout sub-streets. Flagged here, warned at dump_result time
-    // (dump_rounds is usually set after start_solve).
-    this->gpu_chance_loaded = (this->current_round < 3);
 }
 
 void CommandLineTool::processCommand(string input) {
@@ -209,7 +204,13 @@ void CommandLineTool::processCommand(string input) {
         if(bet_type == "bet" || bet_type == "raise" || bet_type == "donk"){
             sizes->clear();
             for(std::size_t i = 3;i < params.size();i ++ ){
-                sizes->push_back(stof(params[i]));
+                // "2.5x" -> 250 (multiple of pot in hundredths, like the GUI's
+                // sizes_convert); plain numbers are percentages of pot.
+                const string& tok = params[i];
+                if(!tok.empty() && (tok.back() == 'x' || tok.back() == 'X'))
+                    sizes->push_back(stof(tok.substr(0, tok.size()-1)) * 100.0f);
+                else
+                    sizes->push_back(stof(tok));
             }
         }
     }else if(command == "set_accuracy"){
@@ -231,9 +232,24 @@ void CommandLineTool::processCommand(string input) {
     }else if(command == "start_solve"){
         string eng = this->resolveEngine();
         cout << "<<<START SOLVING>>> engine=" << eng << endl;
+        bool solved = false;
         if(eng == "gpu"){
-            this->solveOnGpu();
-        }else{
+            try{
+                this->solveOnGpu();
+                solved = true;
+            }catch(const std::exception& e){
+                // A GPU failure (most often VRAM OOM on a large flop) must not
+                // leave the user without a result: when the engine was auto-routed,
+                // fall back to the CPU solver. An explicit "-e gpu" surfaces the error.
+                if(this->engine == "auto"){
+                    cout << "GPU solve failed (" << e.what()
+                         << "); falling back to CPU." << endl;
+                }else{
+                    throw;
+                }
+            }
+        }
+        if(!solved){
             this->ps.train(
                     this->range_ip,
                     this->range_oop,
@@ -250,12 +266,6 @@ void CommandLineTool::processCommand(string input) {
             );
         }
     }else if(command == "dump_result"){
-        if(this->gpu_chance_loaded && this->dump_rounds >= 2){
-            cout << "WARNING: GPU solved a turn/flop subgame but only the root street's "
-                    "runout strategy is available; dump_rounds=" << this->dump_rounds
-                 << " will emit uniform placeholders for deeper per-runout streets. "
-                    "Re-run with --engine cpu for a complete multi-street dump." << endl;
-        }
         string output_file = paramstr;
         this->ps.dump_strategy(QString::fromStdString(output_file),this->dump_rounds);
     }else if(command == "set_dump_rounds"){

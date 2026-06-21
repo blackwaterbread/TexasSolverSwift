@@ -54,7 +54,6 @@ private:
     string gpu_solver_path = "cuda/build/river_gpu.exe";
     int gpu_turn_min_iters = 100;          // turn routes to GPU only at/above this
     vector<string> command_buffer;         // raw commands, replayed to the serializer
-    bool gpu_chance_loaded = false;        // last solve was GPU on a turn/flop subgame
     string resolveEngine();
     void solveOnGpu();
 };

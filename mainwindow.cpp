@@ -418,6 +418,10 @@ QString MainWindow::generate_config_text(){
 // linked in): write config -> SerializeRiver.exe -> river_gpu.exe --dump.
 // Output and progress are streamed to the log window.
 void MainWindow::on_solveGpuButton_clicked(){
+    startGpuSolve(false);
+}
+
+void MainWindow::startGpuSolve(bool autoFallback){
     QSettings setting("TexasSolver", "Setting");
     setting.beginGroup("gpu");
     QString serExe = setting.value("serializer_path",
@@ -433,11 +437,13 @@ void MainWindow::on_solveGpuButton_clicked(){
     if(!QFile::exists(serExe)){
         log(tr("GPU serializer not found: ") + serExe +
             tr("  (set [gpu]/serializer_path in settings)"));
+        if(autoFallback){ log(tr("Auto: falling back to CPU solver.")); startCpuSolve(); }
         return;
     }
     if(!QFile::exists(gpuExe)){
         log(tr("GPU solver not found: ") + gpuExe +
             tr("  (set [gpu]/solver_path in settings)"));
+        if(autoFallback){ log(tr("Auto: falling back to CPU solver.")); startCpuSolve(); }
         return;
     }
 
@@ -452,6 +458,7 @@ void MainWindow::on_solveGpuButton_clicked(){
         QFile cfgFile(cfgPath);
         if(!cfgFile.open(QIODevice::WriteOnly | QIODevice::Text)){
             log(tr("Failed to write GPU config file: ") + cfgPath);
+            if(autoFallback){ log(tr("Auto: falling back to CPU solver.")); startCpuSolve(); }
             return;
         }
         QTextStream ts(&cfgFile);
@@ -478,10 +485,14 @@ void MainWindow::on_solveGpuButton_clicked(){
         this->ui->logOutput->log_with_signal(QString::fromLocal8Bit(ser->readAll()).trimmed());
     });
     connect(ser, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-            [this, ser, gpuExe, subgamePath, outPath, iters, childEnv](int code, QProcess::ExitStatus){
+            [this, ser, gpuExe, subgamePath, outPath, iters, childEnv, autoFallback](int code, QProcess::ExitStatus){
         if(code != 0){
             this->ui->logOutput->log_with_signal(tr("Serialization failed (exit %1).").arg(code));
             ser->deleteLater();
+            if(autoFallback){
+                this->ui->logOutput->log_with_signal(tr("Auto: falling back to CPU solver."));
+                this->startCpuSolve();
+            }
             return;
         }
         this->ui->logOutput->log_with_signal(tr("=== GPU pipeline: solving on GPU ==="));
@@ -492,7 +503,7 @@ void MainWindow::on_solveGpuButton_clicked(){
             this->ui->logOutput->log_with_signal(QString::fromLocal8Bit(slv->readAll()).trimmed());
         });
         connect(slv, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-                [this, slv, outPath](int scode, QProcess::ExitStatus){
+                [this, slv, outPath, autoFallback](int scode, QProcess::ExitStatus){
             if(scode == 0){
                 this->ui->logOutput->log_with_signal(tr("GPU solve done. Strategy: ") + outPath);
                 // Load the GPU result into the in-memory tree so "Show Result"
@@ -505,6 +516,10 @@ void MainWindow::on_solveGpuButton_clicked(){
                 this->qSolverJob->start();
             }else{
                 this->ui->logOutput->log_with_signal(tr("GPU solve failed (exit %1).").arg(scode));
+                if(autoFallback){
+                    this->ui->logOutput->log_with_signal(tr("Auto: falling back to CPU solver."));
+                    this->startCpuSolve();
+                }
             }
             slv->deleteLater();
         });
@@ -528,14 +543,37 @@ void MainWindow::on_ip_range(QString range_text){
     this->ui->ipRangeText->setText(range_text);
 }
 
-void MainWindow::on_buttomSolve_clicked()
-{   
+void MainWindow::startCpuSolve()
+{
     qSolverJob->max_iteration = ui->iterationText->text().toInt();
     qSolverJob->accuracy = ui->exploitabilityText->text().toFloat();
     qSolverJob->print_interval = ui->logIntervalText->text().toInt();
     qSolverJob->thread_number = ui->threadsText->text().toInt();
     qSolverJob->current_mission = QSolverJob::MissionType::SOLVING;
     qSolverJob->start();
+}
+
+void MainWindow::on_buttomSolve_clicked()
+{
+    startCpuSolve();
+}
+
+// Auto engine: mirror the CLI router (river -> CPU; flop -> GPU; turn -> GPU only
+// when the iteration count amortizes the GPU pipeline's fixed overhead). On a GPU
+// failure the pipeline falls back to the CPU solver so the user always gets a result.
+void MainWindow::on_solveAutoButton_clicked()
+{
+    vector<string> board_arr = string_split(this->ui->boardText->toPlainText().toStdString(), ',');
+    int iters = this->ui->iterationText->text().toInt();
+    bool useGpu;
+    if(board_arr.size() == 5) useGpu = false;              // river
+    else if(board_arr.size() == 4) useGpu = (iters >= 100); // turn
+    else useGpu = true;                                     // flop (3) / other
+    this->ui->logOutput->log_with_signal(
+        tr("Auto engine: board=%1 cards, iters=%2 -> %3")
+            .arg((int)board_arr.size()).arg(iters).arg(useGpu ? "GPU" : "CPU"));
+    if(useGpu) startGpuSolve(true);
+    else startCpuSolve();
 }
 
 Ui::MainWindow * MainWindow::getPriUi(){

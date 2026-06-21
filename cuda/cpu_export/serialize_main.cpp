@@ -45,6 +45,16 @@ static StreetSetting empty_setting() {
     return StreetSetting(vector<float>{}, vector<float>{}, vector<float>{}, true);
 }
 
+// Parses one bet-size token. "x" suffix means a multiple of the pot expressed in
+// hundredths (matches the GUI's sizes_convert): "2.5x" -> 250, "50" -> 50. The
+// in-memory CPU tree the GUI builds uses the same convention, so the serialized
+// tree must too or node ids misalign on injection.
+static float parse_bet_size(const string& tok) {
+    if (!tok.empty() && (tok.back() == 'x' || tok.back() == 'X'))
+        return stof(tok.substr(0, tok.size() - 1)) * 100.0f;
+    return stof(tok);
+}
+
 // Same filtering as the solver's noDuplicateRange: drop combos that collide with
 // the board. (Duplicate detection is unnecessary for our controlled ranges.)
 static vector<PrivateCards> filterRange(const vector<PrivateCards>& range, uint64_t board_long) {
@@ -132,7 +142,7 @@ int main(int argc, const char** argv) {
             else throw runtime_error("bad bet type");
             if (sizes) {
                 sizes->clear();
-                for (size_t i = 3; i < params.size(); i++) sizes->push_back(stof(params[i]));
+                for (size_t i = 3; i < params.size(); i++) sizes->push_back(parse_bet_size(params[i]));
             }
         } else if (command == "set_allin_threshold") {
             allin_threshold = stof(paramstr);

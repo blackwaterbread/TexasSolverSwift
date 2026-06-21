@@ -33,6 +33,7 @@ public:
 private slots:
     void on_buttomSolve_clicked();
     void on_solveGpuButton_clicked();
+    void on_solveAutoButton_clicked();
     void on_clearLogButtom_clicked();
     void on_buildTreeButtom_clicked();
     void on_actionjson_triggered();
@@ -62,6 +63,8 @@ private slots:
 private:
     void clear_all_params();
     QString generate_config_text();
+    void startCpuSolve();
+    void startGpuSolve(bool autoFallback);
     Ui::MainWindow *ui = NULL;
     QSolverJob* qSolverJob = NULL;
     QFileSystemModel * qFileSystemModel = NULL;

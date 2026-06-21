@@ -8,6 +8,25 @@ using json = nlohmann::json;
 
 namespace texgpu {
 
+// Builds the per-hand strategy map for one trainset slot of an action node.
+// `slot` indexes the compound runout; layout is (slot*nact + action)*nc + hand.
+static json strat_map_for_slot(const Subgame& sg, const Node& nd,
+                               const std::vector<float>& av,
+                               int slot, int nact, int nc) {
+    json jstrat = json::object();
+    size_t base = (size_t)slot * nact * nc;
+    for (int h = 0; h < nc; h++) {
+        json probs = json::array();
+        for (int a = 0; a < nact; a++) {
+            size_t idx = base + (size_t)a * nc + h;
+            float v = (idx < av.size()) ? av[idx] : 0.0f;
+            probs.push_back(v);
+        }
+        jstrat[sg.ranges[nd.player][h].label] = probs;
+    }
+    return jstrat;
+}
+
 void dump_strategy_json(const Subgame& sg,
                         const std::vector<std::vector<float>>& avgs,
                         const std::string& path) {
@@ -24,6 +43,9 @@ void dump_strategy_json(const Subgame& sg,
         root["range"][p] = jr;
     }
 
+    const int ND = sg.ndeals();
+    const int root_round = 3 - sg.chance_levels;   // river=3, turn=2, flop=1
+
     json jnodes = json::object();
     for (size_t i = 0; i < sg.nodes.size(); i++) {
         const Node& nd = sg.nodes[i];
@@ -39,18 +61,38 @@ void dump_strategy_json(const Subgame& sg,
         jn["pot"] = nd.pot;
         jn["actions"] = nd.labels;
 
-        json jstrat = json::object();
-        for (int h = 0; h < nc; h++) {
-            json probs = json::array();
-            for (int a = 0; a < nact; a++) {
-                // slot 0 layout: (0*nact + a)*nc + h
-                size_t idx = (size_t)a * nc + h;
-                float v = (idx < av.size()) ? av[idx] : 0.0f;
-                probs.push_back(v);
+        // chance levels dealt above this node (0 => no chance, single slot).
+        int level = nd.round - root_round;
+        if (level <= 0) {
+            // No chance above: a single strategy slot (slot 0), flat layout.
+            jn["strategy"] = strat_map_for_slot(sg, nd, av, 0, nact, nc);
+        } else {
+            // One trainset per compound runout. Slot b is base-ND with `level`
+            // digits, most-significant = first dealt (turn before river). Emit a
+            // strategy per valid runout keyed by the comma-joined card labels so
+            // the CPU loader can map it back to getTrainable(deal).
+            long long nsets = 1; for (int L = 0; L < level; L++) nsets *= ND;
+            json jdeals = json::object();
+            for (long long b = 0; b < nsets; b++) {
+                // decode digits (most significant first) and skip impossible
+                // runouts that deal the same card twice.
+                std::vector<int> didx(level);
+                long long rem = b;
+                bool ok = true;
+                for (int k = level - 1; k >= 0; k--) { didx[k] = (int)(rem % ND); rem /= ND; }
+                for (int x = 0; x < level && ok; x++)
+                    for (int y = x + 1; y < level && ok; y++)
+                        if (didx[x] == didx[y]) ok = false;
+                if (!ok) continue;
+                std::string key;
+                for (int k = 0; k < level; k++) {
+                    if (k) key += ",";
+                    key += sg.deal_strs[didx[k]];
+                }
+                jdeals[key] = strat_map_for_slot(sg, nd, av, (int)b, nact, nc);
             }
-            jstrat[sg.ranges[nd.player][h].label] = probs;
+            jn["deals"] = jdeals;
         }
-        jn["strategy"] = jstrat;
         jnodes[std::to_string(i)] = jn;
     }
     root["nodes"] = jnodes;
