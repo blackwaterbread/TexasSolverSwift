@@ -15,12 +15,14 @@ int main(int argc, char** argv) {
     std::string golden_path = "cuda/configs/golden_river.json";
     std::string dump_path;   // when set: solve, write strategy json, skip golden compare
     int iters = 200;
+    bool force_stream = false;   // force host-streaming of river trainables (B-1)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if ((a == "-s" || a == "--subgame") && i + 1 < argc) subgame_path = argv[++i];
         else if ((a == "-g" || a == "--golden") && i + 1 < argc) golden_path = argv[++i];
         else if ((a == "-d" || a == "--dump") && i + 1 < argc) dump_path = argv[++i];
         else if ((a == "-n" || a == "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (a == "--stream") force_stream = true;
     }
 
     if (!texgpu::print_device_info()) {
@@ -65,7 +67,7 @@ int main(int argc, char** argv) {
         const char* kind = sg.chance_levels >= 2 ? "flop/2-chance"
                          : sg.chance_levels == 1 ? "turn/1-chance" : "river";
         printf("--- full CFR solve (%s), dump mode ---\n", kind);
-        texgpu::CudaCfrSolver solver(sg);
+        texgpu::CudaCfrSolver solver(sg, force_stream);
         double secs = solver.train(iters);
         auto avgs = solver.averageStrategies();
         printf("solved %d iterations on GPU in %.3f s (%.2f iters/s).\n",
@@ -95,7 +97,7 @@ int main(int argc, char** argv) {
     const char* kind = sg.chance_levels >= 2 ? "flop/2-chance"
                      : sg.chance_levels == 1 ? "turn/1-chance" : "river";
     printf("--- full CFR solve vs golden (%s) ---\n", kind);
-    texgpu::CudaCfrSolver solver(sg);
+    texgpu::CudaCfrSolver solver(sg, force_stream);
     double secs = solver.train(iters);
     auto avgs = solver.averageStrategies();
     printf("solved %d iterations on GPU in %.3f s (%.2f iters/s).\n", iters, secs, iters / secs);

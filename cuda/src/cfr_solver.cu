@@ -6,6 +6,24 @@
 #include <cmath>
 #include <stdexcept>
 #include <cstdio>
+#include <cstring>
+
+// Available physical host RAM, used to decide whether host-streaming the (GB-scale)
+// river trainable is safe. Pinning/allocating more than fits destabilizes the OS, so
+// streaming declines and falls back when this is too small. Returns 0 if unknown.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+static size_t host_avail_bytes() { MEMORYSTATUSEX s; s.dwLength = sizeof(s); return GlobalMemoryStatusEx(&s) ? (size_t)s.ullAvailPhys : 0; }
+#else
+#include <unistd.h>
+static size_t host_avail_bytes() {
+    long pages = sysconf(_SC_AVPHYS_PAGES), ps = sysconf(_SC_PAGESIZE);
+    return (pages > 0 && ps > 0) ? (size_t)pages * ps : 0;
+}
+#endif
 
 namespace texgpu {
 
@@ -226,11 +244,14 @@ __global__ void g_terminal_b(const int* pc1, const int* pc2, int pn,
                              const int* oc1, const int* oc2, const float* reach, int on,
                              float payoff, const int* lvl1cards, int nd1, const int* lvl2cards, int nd2,
                              int level, float* out, int B,
-                             int riv_iso, const int* slot2turn, const int* rivrepcards) {
+                             int riv_iso, const int* slot2turn, const int* rivrepcards, int extra_card) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= B * pn) return;
     int b = t / pn, i = t % pn;
     int a1 = pc1[i], a2 = pc2[i];
+    // Streamed river subtree: b is the river digit (level==1 over the river set) and the
+    // turn-deal card is supplied separately (it is not encoded in b). Exclude it too.
+    if (extra_card >= 0 && (a1 == extra_card || a2 == extra_card)) { out[t] = 0.0f; return; }
     if (riv_iso && level == 2) {
         // Ragged level-2: batch b is an absolute river-rep slot. Exclude hands hitting
         // either the turn-rep card (lvl1cards[slot2turn[b]]) or the river-rep card.
@@ -279,6 +300,23 @@ __global__ void g_chance_expand(const float* reach, float* out, const int* oc1, 
         }
     }
     out[t] = bad ? 0.0f : reach[(size_t)b_in * on + h] * inv;
+}
+
+// Streamed river chance EXPAND (one turn deal at a time). The parent reach is the
+// single turn-deal row [on]; produce one river reach row per river card r ([ND*on],
+// index r*on+h). Zero a slot when the river card hits the opponent hand or repeats
+// the turn-deal card (turncard); else scale by 1/possible_deals. Equivalent to one
+// b_in slice of g_chance_expand but with the turn card passed explicitly (b carries
+// only the river digit in the streamed walk).
+__global__ void g_chance_expand_stream(const float* reach_row, float* out, const int* oc1, const int* oc2,
+                                       const int* rivercards, int ND, int turncard, int on, float inv) {
+    size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (size_t)ND * on) return;
+    int h = (int)(t % on);
+    int r = (int)(t / on);
+    int card_r = rivercards[r];
+    bool bad = (oc1[h] == card_r || oc2[h] == card_r || card_r == turncard);
+    out[t] = bad ? 0.0f : reach_row[h] * inv;
 }
 
 // Chance reduce: out[b_in*pn + i] = sum over the ND child deals of util.
@@ -515,7 +553,7 @@ static void* dmalloc(size_t bytes, const char* what) {
     return p;
 }
 
-CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
+CudaCfrSolver::CudaCfrSolver(const Subgame& sg, bool stream) : sg_(sg) {
     root_round_ = sg.nodes[sg.root].round;
     ND_ = std::max(1, sg.ndeals());
 
@@ -639,6 +677,9 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
     d_rplus_.assign(N, nullptr);
     d_cum_.assign(N, nullptr);
     nact_.assign(N, 0);
+    h_rplus_.assign(N, nullptr);
+    h_cum_.assign(N, nullptr);
+    streamed_.assign(N, 0);
 
     // VRAM pre-flight. Trainables dominate the footprint (sets*nact*nc fp16, twice
     // for rplus+cum), and a full-range flop (sets=ND^2) is GB-scale. Estimate and
@@ -650,11 +691,31 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
         size_t sz = (size_t)ntrainsets(i) * nd.children.size() * ncards_[nd.player];
         trainable_bytes += sz * sizeof(__half) * 2;   // rplus + cum
     }
-    {
-        size_t freeB = 0, totB = 0; cudaMemGetInfo(&freeB, &totB);
-        printf("  VRAM: trainables ~%.0f MB (rplus+cum fp16) | %.0f MB free of %.0f MB\n",
-               trainable_bytes / 1048576.0, freeB / 1048576.0, totB / 1048576.0);
-    }
+    size_t freeB = 0, totB = 0; cudaMemGetInfo(&freeB, &totB);
+
+    // B-1 streaming decision. Only the river (level-2) nodes are huge and only the
+    // plain non-iso 2-level flop has the streamable structure (the iso paths reduce
+    // the batch by their own scheme). Auto-enable when the resident trainable would
+    // not comfortably fit; `stream` forces it on (for validation on small spots).
+    bool streamable = (sg.chance_levels == 2) && !iso_on_ && !riv_iso_on_;
+    bool want_stream = streamable && (stream || trainable_bytes > (size_t)(freeB * 0.8));
+    // The full trainable lives in host RAM while streaming. Refuse if it would not fit
+    // available physical RAM with headroom — allocating GB-scale beyond RAM thrashes
+    // and destabilizes the OS. Declining lets the caller's OOM->CPU fallback take over.
+    size_t hostAvail = host_avail_bytes();
+    size_t hostNeed = trainable_bytes + ((size_t)512 << 20);   // + ~0.5GB working slack
+    bool hostOk = (hostAvail == 0) || (hostNeed + ((size_t)2 << 30) <= hostAvail);  // keep 2GB free
+    stream_on_ = want_stream && hostOk;
+    if (want_stream && !hostOk)
+        printf("  NOTE: streaming needs ~%.1f GB host RAM, only ~%.1f GB available; NOT streaming"
+               " (falls back to OOM->CPU).\n", hostNeed / 1073741824.0, hostAvail / 1073741824.0);
+
+    printf("  VRAM: trainables ~%.0f MB (rplus+cum fp16) | %.0f MB free of %.0f MB%s\n",
+           trainable_bytes / 1048576.0, freeB / 1048576.0, totB / 1048576.0,
+           stream_on_ ? "  [STREAMING river trainables from host (pageable)]" : "");
+    if (stream_on_ && hostAvail)
+        printf("  host RAM: streaming %.1f GB of trainables (%.1f GB available)\n",
+               trainable_bytes / 1073741824.0, hostAvail / 1073741824.0);
 
     for (int i = 0; i < N; ++i) {
         const Node& nd = sg.nodes[i];
@@ -662,17 +723,43 @@ CudaCfrSolver::CudaCfrSolver(const Subgame& sg) : sg_(sg) {
         int nact = (int)nd.children.size();
         int nc = ncards_[nd.player];
         int sets = ntrainsets(i);
-        size_t sz = (size_t)sets * nact * nc;
         nact_[i] = nact;
-        d_rplus_[i] = (__half*)dmalloc(sz * sizeof(__half), "trainable rplus"); cudaMemset(d_rplus_[i], 0, sz * sizeof(__half));
-        d_cum_[i] = (__half*)dmalloc(sz * sizeof(__half), "trainable cum"); cudaMemset(d_cum_[i], 0, sz * sizeof(__half));
+        // Stream the river (level-2) action nodes: full trainable in host-pinned RAM,
+        // device buffer holds only one turn chunk (ND sets). Shallower (turn) nodes
+        // are ND-times smaller, so keep them fully device-resident.
+        if (stream_on_ && level(i) == 2) {
+            streamed_[i] = 1;
+            size_t full = (size_t)sets * nact * nc;          // ND^2 sets
+            size_t chunk = (size_t)ND_ * nact * nc;          // one turn = ND sets
+            // Pageable (swappable) host RAM, NOT pinned: the full trainable is GB-scale
+            // and pinning that much page-locked memory starves and destabilizes the OS.
+            // The synchronous chunk copies don't need pinning; future overlap would pin
+            // only the small per-chunk staging buffers, never the whole trainable.
+            h_rplus_[i] = new __half[full]();
+            h_cum_[i] = new __half[full]();
+            d_rplus_[i] = (__half*)dmalloc(chunk * sizeof(__half), "river chunk rplus"); cudaMemset(d_rplus_[i], 0, chunk * sizeof(__half));
+            d_cum_[i] = (__half*)dmalloc(chunk * sizeof(__half), "river chunk cum"); cudaMemset(d_cum_[i], 0, chunk * sizeof(__half));
+        } else {
+            size_t sz = (size_t)sets * nact * nc;
+            d_rplus_[i] = (__half*)dmalloc(sz * sizeof(__half), "trainable rplus"); cudaMemset(d_rplus_[i], 0, sz * sizeof(__half));
+            d_cum_[i] = (__half*)dmalloc(sz * sizeof(__half), "trainable cum"); cudaMemset(d_cum_[i], 0, sz * sizeof(__half));
+        }
     }
+
+    // Per river-chance node, list its streamed descendants so each only loads/stores
+    // its own chunk (one full-trainable pass per iteration, not one per chance node).
+    stream_subtree_.assign(N, {});
+    if (stream_on_)
+        for (int i = 0; i < N; ++i)
+            if (sg.nodes[i].type == NT_CHANCE && level(i) == 2)
+                collectStreamed(i, stream_subtree_[i]);
 
     // LIFO scratch arena. Batched walk widens every scratch buffer by the node's
     // B = ND^level; the deepest level reaches ND^chance_levels. Peak usage is one
-    // root-to-leaf path, tiny vs this floor for the modest test ranges.
+    // root-to-leaf path, tiny vs this floor for the modest test ranges. Streaming caps
+    // the live batch at ND (one turn's rivers), so the arena floor shrinks accordingly.
     int maxnc = std::max(ncards_[0], ncards_[1]);
-    int maxB = Bprod(sg.chance_levels);
+    int maxB = stream_on_ ? ND_ : Bprod(sg.chance_levels);
     size_t need = (size_t)maxnc * 64 * (size_t)maxB;
     arena_cap_ = std::max((size_t)256 * 1024 * 1024 / sizeof(float), need);
     arena_ = (float*)dmalloc(arena_cap_ * sizeof(float), "scratch arena");
@@ -702,10 +789,47 @@ CudaCfrSolver::~CudaCfrSolver() {
     }
     for (auto p : d_rplus_) cudaFree(p);
     for (auto p : d_cum_) cudaFree(p);
+    for (auto p : h_rplus_) delete[] p;
+    for (auto p : h_cum_) delete[] p;
     cudaFree(arena_);
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
     if (d_coefs_) cudaFree(d_coefs_);
     cudaStreamDestroy(stream_);
+}
+
+// Bytes of one turn chunk (ND sets) of a streamed river node's regret/strategy.
+size_t CudaCfrSolver::chunkSetBytes(int nodeid) const {
+    return (size_t)ND_ * nact_[nodeid] * ncards_[sg_.nodes[nodeid].player] * sizeof(__half);
+}
+
+// Streamed action nodes reachable below `nodeid` (used to scope a river chance node's
+// load/store to its own subtree). Chance nodes have a single child; recurse all.
+void CudaCfrSolver::collectStreamed(int nodeid, std::vector<int>& out) const {
+    const Node& nd = sg_.nodes[nodeid];
+    if (nd.type == NT_ACTION && streamed_[nodeid]) out.push_back(nodeid);
+    for (int c : nd.children) collectStreamed(c, out);
+}
+
+// Copy turn-deal t's ND-set slice of the given streamed river nodes from host into
+// their device chunk buffers (regret + cumulative). Issued on stream_ so it orders
+// with the subtree kernels that follow.
+void CudaCfrSolver::streamLoadChunk(const std::vector<int>& nodes, int t) {
+    for (int i : nodes) {
+        size_t bytes = chunkSetBytes(i);
+        size_t elemOff = (size_t)t * ND_ * nact_[i] * ncards_[sg_.nodes[i].player];
+        cudaMemcpyAsync(d_rplus_[i], h_rplus_[i] + elemOff, bytes, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(d_cum_[i], h_cum_[i] + elemOff, bytes, cudaMemcpyHostToDevice, stream_);
+    }
+}
+
+// Copy the (now updated) chunk back to host after the turn's river subtree walk.
+void CudaCfrSolver::streamStoreChunk(const std::vector<int>& nodes, int t) {
+    for (int i : nodes) {
+        size_t bytes = chunkSetBytes(i);
+        size_t elemOff = (size_t)t * ND_ * nact_[i] * ncards_[sg_.nodes[i].player];
+        cudaMemcpyAsync(h_rplus_[i] + elemOff, d_rplus_[i], bytes, cudaMemcpyDeviceToHost, stream_);
+        cudaMemcpyAsync(h_cum_[i] + elemOff, d_cum_[i], bytes, cudaMemcpyDeviceToHost, stream_);
+    }
 }
 
 float* CudaCfrSolver::arena_alloc(size_t n) {
@@ -727,6 +851,11 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
     int on = ncards_[1 - player];             // reach indexed by opponent's range
     int lvl = level(nodeid);                  // chance depth (0 above all chances)
     int B = Bprod(lvl);                       // batch = compound runouts reaching here
+    // Streamed river walk: the subtree below the river chance runs one turn deal at a
+    // time, so its batch is ND (one turn's rivers), not the full ND^2. The per-deal
+    // rank/order tables are sliced to this turn's rows via deal_row_base_ (= turn*ND).
+    if (streaming_active_ && lvl == 2) B = stream_b_;
+    size_t drow = (size_t)deal_row_base_;     // dealrank/dealorder row offset (0 unless streamed)
     bool use_dealrank = sg_.has_chance && lvl >= 1;
 
     if (nd.type == NT_SHOWDOWN) {
@@ -752,14 +881,14 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
             float* d_pref = arena_alloc((size_t)B * ((size_t)on + 1));
             int n2 = 2; while (n2 < on) n2 <<= 1;
             dim3 scan_grid(1, B);
-            g_sd_scan_b<<<scan_grid, n2 / 2, n2 * sizeof(float), stream_>>>(d_reach, d_dealorder_[O], d_pref, on, n2);
+            g_sd_scan_b<<<scan_grid, n2 / 2, n2 * sizeof(float), stream_>>>(d_reach, d_dealorder_[O] + drow * on, d_pref, on, n2);
             dim3 eval_grid(blocks_for((size_t)pn, T), B);
-            g_sd_eval_b<<<eval_grid, T, 0, stream_>>>(d_dealrank_[player], pn, d_pref, d_dealsortedranks_[O], on,
-                d_c1_[player], d_c2_[player], d_cardoff_[O], d_cardidx_[O], d_dealrank_[1 - player], d_reach, win, lose, d_out);
+            g_sd_eval_b<<<eval_grid, T, 0, stream_>>>(d_dealrank_[player] + drow * pn, pn, d_pref, d_dealsortedranks_[O] + drow * on, on,
+                d_c1_[player], d_c2_[player], d_cardoff_[O], d_cardidx_[O], d_dealrank_[1 - player] + drow * on, d_reach, win, lose, d_out);
             return;
         }
-        const int* prk = use_dealrank ? d_dealrank_[player] : d_rank_[player];
-        const int* ork = use_dealrank ? d_dealrank_[1 - player] : d_rank_[1 - player];
+        const int* prk = use_dealrank ? d_dealrank_[player] + drow * pn : d_rank_[player];
+        const int* ork = use_dealrank ? d_dealrank_[1 - player] + drow * on : d_rank_[1 - player];
         dim3 sd_grid(blocks_for((size_t)pn, T), B);
         size_t sd_shmem = (size_t)T * (3 * sizeof(int) + sizeof(float));
         g_showdown_b<<<sd_grid, T, sd_shmem, stream_>>>(d_c1_[player], d_c2_[player], prk, pn,
@@ -769,10 +898,20 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
     }
     if (nd.type == NT_TERMINAL) {
         float payoff = (float)nd.pay[player];
+        // Streamed river terminal: b is just the river digit over the full river set,
+        // so decode as level 1 (lvl1cards = river set) and exclude the turn card via
+        // extra_card. Otherwise the normal compound-deal decode (extra_card = -1).
+        const int* l1 = d_lvl1cards_; int n1 = nd_lvl1_;
+        const int* l2 = d_lvl2cards_; int n2 = nd_lvl2_;
+        int term_level = lvl, extra = -1, riv = riv_iso_on_ ? 1 : 0;
+        if (streaming_active_ && lvl == 2) {
+            l1 = d_deal_cards_; n1 = ND_; l2 = nullptr; n2 = 0;
+            term_level = 1; extra = stream_turn_card_; riv = 0;
+        }
         g_terminal_b<<<blocks_for((size_t)B * pn, T), T, 0, stream_>>>(d_c1_[player], d_c2_[player], pn,
                                                            d_c1_[1 - player], d_c2_[1 - player], d_reach, on,
-                                                           payoff, d_lvl1cards_, nd_lvl1_, d_lvl2cards_, nd_lvl2_, lvl, d_out, B,
-                                                           riv_iso_on_ ? 1 : 0, d_riv_slot2turn_, d_riv_rep_cards_);
+                                                           payoff, l1, n1, l2, n2, term_level, d_out, B,
+                                                           riv, d_riv_slot2turn_, d_riv_rep_cards_, extra);
         return;
     }
     if (nd.type == NT_CHANCE) {
@@ -796,6 +935,33 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
             g_chance_reduce_riv2<<<blocks_for((size_t)Bin * pn, T), T, 0, stream_>>>(
                 d_cu2, d_out, pn, Bin, ND_, d_riv_fullslot_, d_riv_perm_[player]);
             arena_top_ = mark2;
+            return;
+        }
+
+        // Host-streamed river chance (non-iso flop): the entering batch Bin == ND is
+        // one row per turn deal. Process turn deals one at a time so only ND river
+        // trainsets are device-resident: load that turn's chunk, expand its reach into
+        // ND river reaches, walk the river subtree with B=ND, reduce to this turn's
+        // util row, store the chunk back. br mode keeps the full path (avg strategy is
+        // resident there, only used on the small validation spots). Lossless.
+        if (stream_on_ && out_level == 2 && !br) {
+            const std::vector<int>& subtree = stream_subtree_[nodeid];
+            for (int t = 0; t < Bin; ++t) {
+                streamLoadChunk(subtree, t);
+                int turncard = sg_.deal_cards[t];
+                size_t markt = arena_top_;
+                float* d_nr = arena_alloc((size_t)ND_ * on);
+                g_chance_expand_stream<<<blocks_for((size_t)ND_ * on, T), T, 0, stream_>>>(
+                    d_reach + (size_t)t * on, d_nr, d_c1_[1 - player], d_c2_[1 - player],
+                    d_deal_cards_, ND_, turncard, on, inv);
+                float* d_cu = arena_alloc((size_t)ND_ * pn);
+                streaming_active_ = true; stream_b_ = ND_; deal_row_base_ = t * ND_; stream_turn_card_ = turncard;
+                cfr(player, child, d_nr, d_cu, br);
+                streaming_active_ = false; deal_row_base_ = 0; stream_turn_card_ = -1;
+                g_chance_reduce<<<blocks_for((size_t)pn, T), T, 0, stream_>>>(d_cu, d_out + (size_t)t * pn, pn, ND_, 1);
+                streamStoreChunk(subtree, t);
+                arena_top_ = markt;
+            }
             return;
         }
 
@@ -898,22 +1064,38 @@ double CudaCfrSolver::train(int iters) {
         cudaMemcpy(d_init_[p], w.data(), n * sizeof(float), cudaMemcpyHostToDevice);
     }
 
-    // Capture one iteration's kernel stream into a replayable graph.
-    cudaGraph_t graph = nullptr;
-    cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal);
-    runIteration();
-    cudaStreamEndCapture(stream_, &graph);
-    cudaGraphInstantiate(&graph_exec_, graph, nullptr, nullptr, 0);
-    cudaGraphDestroy(graph);
+    // Streaming mode replays a host-side loop over turn chunks with interleaved
+    // host<->device copies whose offsets change every chunk, which a single static
+    // CUDA graph cannot capture. The streamed flop is compute-bound, so running the
+    // walk eagerly (no graph) costs nothing measurable. Other modes capture once.
+    std::chrono::high_resolution_clock::time_point t0, t1;
+    if (stream_on_) {
+        cudaDeviceSynchronize();
+        t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iters; ++it) {
+            g_set_coefs<<<1, 1, 0, stream_>>>(d_coefs_, it);
+            runIteration();
+        }
+        cudaStreamSynchronize(stream_);
+        t1 = std::chrono::high_resolution_clock::now();
+    } else {
+        // Capture one iteration's kernel stream into a replayable graph.
+        cudaGraph_t graph = nullptr;
+        cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal);
+        runIteration();
+        cudaStreamEndCapture(stream_, &graph);
+        cudaGraphInstantiate(&graph_exec_, graph, nullptr, nullptr, 0);
+        cudaGraphDestroy(graph);
 
-    cudaDeviceSynchronize();
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int it = 0; it < iters; ++it) {
-        g_set_coefs<<<1, 1, 0, stream_>>>(d_coefs_, it);   // per-iter, outside the graph
-        cudaGraphLaunch(graph_exec_, stream_);
+        cudaDeviceSynchronize();
+        t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iters; ++it) {
+            g_set_coefs<<<1, 1, 0, stream_>>>(d_coefs_, it);   // per-iter, outside the graph
+            cudaGraphLaunch(graph_exec_, stream_);
+        }
+        cudaStreamSynchronize(stream_);
+        t1 = std::chrono::high_resolution_clock::now();
     }
-    cudaStreamSynchronize(stream_);
-    auto t1 = std::chrono::high_resolution_clock::now();
 
     cudaFree(d_init_[0]); cudaFree(d_init_[1]);
     d_init_[0] = d_init_[1] = nullptr;
@@ -927,6 +1109,7 @@ double CudaCfrSolver::train(int iters) {
 
 void CudaCfrSolver::freeRegrets() {
     for (auto& p : d_rplus_) { if (p) { cudaFree(p); p = nullptr; } }
+    for (auto& p : h_rplus_) { if (p) { delete[] p; p = nullptr; } }   // host full regret (streamed)
 }
 
 std::vector<std::vector<float>> CudaCfrSolver::averageStrategies() {
@@ -938,13 +1121,29 @@ std::vector<std::vector<float>> CudaCfrSolver::averageStrategies() {
         int nact = nact_[i];
         int nc = ncards_[sg_.nodes[i].player];
         int sets = ntrainsets(i);
-        size_t sz = (size_t)sets * nact * nc;
+        size_t setSz = (size_t)nact * nc;
+        size_t sz = (size_t)sets * setSz;
+        out[i].resize(sz);
+        if (streamed_[i]) {
+            // cum lives in host RAM ([ND^2 sets]); normalize one turn chunk (ND sets)
+            // at a time through the resident device chunk buffer, mirroring training.
+            size_t chunkElems = (size_t)ND_ * setSz;
+            float* d_avg = (float*)dmalloc(chunkElems * sizeof(float), "avg-strategy chunk");
+            for (int t = 0; t < ND_; ++t) {
+                cudaMemcpy(d_cum_[i], h_cum_[i] + (size_t)t * chunkElems, chunkElems * sizeof(__half), cudaMemcpyHostToDevice);
+                for (int s = 0; s < ND_; ++s)
+                    g_avg<<<blocks_for(nc, T), T>>>(d_cum_[i] + (size_t)s * setSz, d_avg + (size_t)s * setSz, nact, nc);
+                cudaDeviceSynchronize();
+                cudaMemcpy(out[i].data() + (size_t)t * chunkElems, d_avg, chunkElems * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+            cudaFree(d_avg);
+            continue;
+        }
         float* d_avg = (float*)dmalloc(sz * sizeof(float), "avg-strategy scratch");
         for (int s = 0; s < sets; ++s)
-            g_avg<<<blocks_for(nc, T), T>>>(d_cum_[i] + (size_t)s * nact * nc,
-                                            d_avg + (size_t)s * nact * nc, nact, nc);
+            g_avg<<<blocks_for(nc, T), T>>>(d_cum_[i] + (size_t)s * setSz,
+                                            d_avg + (size_t)s * setSz, nact, nc);
         cudaDeviceSynchronize();
-        out[i].resize(sz);
         cudaMemcpy(out[i].data(), d_avg, sz * sizeof(float), cudaMemcpyDeviceToHost);
         cudaFree(d_avg);
     }
@@ -956,11 +1155,21 @@ double CudaCfrSolver::exploitability() {
     // Upload the average strategy per action node for the best-response traversal.
     std::vector<std::vector<float>> avgs = averageStrategies();
     d_avgstrat_.assign(N, nullptr);
-    for (int i = 0; i < N; ++i) {
-        if (sg_.nodes[i].type != NT_ACTION) continue;
-        size_t sz = avgs[i].size();
-        d_avgstrat_[i] = (float*)dmalloc(sz * sizeof(float), "best-response avg strategy");
-        cudaMemcpy(d_avgstrat_[i], avgs[i].data(), sz * sizeof(float), cudaMemcpyHostToDevice);
+    // The BR path is not streamed, so it needs the full ND^2 avg strategy resident as
+    // fp32 (2x the fp16 trainable). For a large streamed flop that does not fit; the
+    // metric is validation-only, so skip it cleanly rather than abort the solve.
+    try {
+        for (int i = 0; i < N; ++i) {
+            if (sg_.nodes[i].type != NT_ACTION) continue;
+            size_t sz = avgs[i].size();
+            d_avgstrat_[i] = (float*)dmalloc(sz * sizeof(float), "best-response avg strategy");
+            cudaMemcpy(d_avgstrat_[i], avgs[i].data(), sz * sizeof(float), cudaMemcpyHostToDevice);
+        }
+    } catch (const std::exception& e) {
+        for (int i = 0; i < N; ++i) if (d_avgstrat_[i]) { cudaFree(d_avgstrat_[i]); d_avgstrat_[i] = nullptr; }
+        d_avgstrat_.clear();
+        printf("exploitability: skipped (avg strategy exceeds VRAM under streaming: %s)\n", e.what());
+        return -1.0;
     }
 
     // Opponent reach init = range weights (same as training).

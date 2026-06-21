@@ -10,8 +10,13 @@ namespace texgpu {
 // per-node kernels). Mirrors PCfrSolver's algorithm.
 class CudaCfrSolver {
 public:
-    explicit CudaCfrSolver(const Subgame& sg);
+    // stream: force host-streaming of the river (level-2) trainables (large non-iso
+    // flop). When false the ctor still auto-enables it if the estimated trainable
+    // footprint would not fit in VRAM (and the subgame is a streamable non-iso flop).
+    explicit CudaCfrSolver(const Subgame& sg, bool stream = false);
     ~CudaCfrSolver();
+
+    bool streaming() const { return stream_on_; }
 
     // Runs `iters` DCFR iterations. Returns wall-clock seconds spent in the loop.
     double train(int iters);
@@ -81,9 +86,36 @@ private:
 
     // per action-node persistent device state (fp16 storage / fp32 compute, like
     // the CPU HF trainable; halves the dominant trainable memory). null if non-action.
+    // For host-streamed river nodes (streamed_[i]) these hold only the CURRENT turn
+    // chunk ([ND*nact*nc]); the full [ND^2*nact*nc] lives in h_rplus_/h_cum_.
     std::vector<__half*> d_rplus_;
     std::vector<__half*> d_cum_;
     std::vector<int> nact_;   // per node
+
+    // --- B-1 host streaming of river (level-2) trainables (large non-iso flop) ---
+    // The persistent river trainable is the VRAM wall (ND^2 sets). When streaming,
+    // each river action node keeps its full regret/strategy in host-pinned memory and
+    // the solve runs one turn deal at a time: load that turn's ND-set chunk into the
+    // device chunk buffer (d_rplus_/d_cum_), walk the river subtree with B=ND, store
+    // the chunk back. The flop is compute-bound, so the copies hide under compute.
+    // Lossless (per-set DCFR math unchanged). Non-iso 2-level flop only.
+    bool stream_on_ = false;              // streaming enabled (auto or forced)
+    bool streaming_active_ = false;       // currently inside the per-chunk river walk
+    int stream_b_ = 0;                    // B override for the streamed subtree (== ND)
+    int deal_row_base_ = 0;               // dealrank/dealorder row offset (turn t * ND)
+    int stream_turn_card_ = -1;           // turn-deal card excluded by streamed terminals
+    std::vector<__half*> h_rplus_;        // [N] host-pinned full river regret (streamed)
+    std::vector<__half*> h_cum_;          // [N] host-pinned full river cumulative (streamed)
+    std::vector<char> streamed_;          // [N] 1 if this node's trainable is host-streamed
+    // Per river-chance node (out_level==2): the streamed action nodes in its subtree.
+    // Each streamed node belongs to exactly one river chance, so loading/storing only
+    // a chance node's own subtree keeps the per-iteration host<->device traffic at one
+    // pass over the full trainable (not one pass per river-chance node).
+    std::vector<std::vector<int>> stream_subtree_;
+    void collectStreamed(int nodeid, std::vector<int>& out) const;
+    size_t chunkSetBytes(int nodeid) const;   // bytes of one turn chunk's ND sets
+    void streamLoadChunk(const std::vector<int>& nodes, int t);   // turn t chunk host->device
+    void streamStoreChunk(const std::vector<int>& nodes, int t);  // turn t chunk device->host
 
     int level(int nodeid) const;   // chance depth = node.round - root_round
 
