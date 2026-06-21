@@ -211,4 +211,42 @@ void dump_strategy_json(const Subgame& sg,
     f << root.dump(1);
 }
 
+void dump_spot_json(const Subgame& sg,
+                    const std::vector<std::vector<float>>& sets,
+                    const std::string& runoutKey,
+                    const std::string& path) {
+    json root;
+    json jboard = json::array();
+    for (int c : sg.board) jboard.push_back(c);
+    root["board"] = jboard;
+    root["root"] = sg.root;
+    root["runout"] = runoutKey;
+    for (int p = 0; p < 2; p++) {
+        json jr = json::array();
+        for (const auto& cb : sg.ranges[p]) jr.push_back(cb.label);
+        root["range"][p] = jr;
+    }
+
+    json jnodes = json::object();
+    for (size_t i = 0; i < sg.nodes.size(); i++) {
+        const Node& nd = sg.nodes[i];
+        if (nd.type != NT_ACTION) continue;
+        int nact = (int)nd.labels.size();
+        int nc = sg.ncombos(nd.player);
+        const std::vector<float>& av = sets[i];   // single set [nact*nc] for this runout
+        json jn;
+        jn["player"] = nd.player;
+        jn["round"] = nd.round;
+        jn["pot"] = nd.pot;
+        jn["actions"] = nd.labels;
+        jn["strategy"] = strat_map_for_slot(sg, nd, av, 0, nact, nc);
+        jnodes[std::to_string(i)] = jn;
+    }
+    root["nodes"] = jnodes;
+
+    std::ofstream f(path);
+    if (!f) throw std::runtime_error("cannot open dump file: " + path);
+    f << root.dump(1);
+}
+
 } // namespace texgpu

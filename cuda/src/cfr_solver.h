@@ -32,6 +32,15 @@ public:
 
     int ntrainsets(int nodeid) const;
 
+    // Memory-safe single-spot extraction: instead of materializing the whole ND^level
+    // tree (GB-scale on a full-range flop), pull just the requested runout's strategy.
+    // averageStrategyForSet returns one action node's [nact*nc] average strategy for a
+    // single trainset slot, read from host cum (streamed nodes) or device cum, no full
+    // copy. averageStrategiesForRunout does this for every action node at one runout
+    // (the dealt-card indices, size == chance_levels; [] for river). Non-iso only.
+    std::vector<float> averageStrategyForSet(int nodeid, int slot) const;
+    std::vector<std::vector<float>> averageStrategiesForRunout(const std::vector<int>& runout) const;
+
 private:
     const Subgame& sg_;
 

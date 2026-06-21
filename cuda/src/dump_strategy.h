@@ -15,4 +15,13 @@ void dump_strategy_json(const Subgame& sg,
                         const std::vector<std::vector<float>>& avgs,
                         const std::string& path);
 
+// Writes a SINGLE runout's strategy (memory-safe alternative to the full dump for
+// large flops). `sets[i]` is action node i's [nact*nc] strategy for the chosen runout
+// (empty for non-action nodes); `runoutKey` is the comma-joined card labels (e.g.
+// "Ac,2d", "" for river). Each action node carries a flat "strategy" map.
+void dump_spot_json(const Subgame& sg,
+                    const std::vector<std::vector<float>>& sets,
+                    const std::string& runoutKey,
+                    const std::string& path);
+
 } // namespace texgpu

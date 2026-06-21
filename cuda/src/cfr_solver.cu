@@ -1150,6 +1150,48 @@ std::vector<std::vector<float>> CudaCfrSolver::averageStrategies() {
     return out;
 }
 
+// One action node's average strategy for a single trainset slot ([nact*nc], layout
+// a*nc+h), normalized per hand like g_avg (avg = cum / sum_a cum, uniform if zero).
+// Reads only that set's cumulative — host for streamed nodes, device otherwise — so a
+// single spot costs nact*nc, not the node's full ND^level trainable.
+std::vector<float> CudaCfrSolver::averageStrategyForSet(int nodeid, int slot) const {
+    int nact = nact_[nodeid];
+    int nc = ncards_[sg_.nodes[nodeid].player];
+    size_t setElems = (size_t)nact * nc;
+    std::vector<__half> cum(setElems);
+    if (streamed_[nodeid]) {
+        memcpy(cum.data(), h_cum_[nodeid] + (size_t)slot * setElems, setElems * sizeof(__half));
+    } else {
+        cudaMemcpy(cum.data(), d_cum_[nodeid] + (size_t)slot * setElems, setElems * sizeof(__half), cudaMemcpyDeviceToHost);
+    }
+    std::vector<float> avg(setElems);
+    for (int h = 0; h < nc; h++) {
+        float c = 0.0f;
+        for (int a = 0; a < nact; a++) c += __half2float(cum[(size_t)a * nc + h]);
+        for (int a = 0; a < nact; a++) {
+            size_t idx = (size_t)a * nc + h;
+            avg[idx] = (c > 0.0f) ? __half2float(cum[idx]) / c : (1.0f / nact);
+        }
+    }
+    return avg;
+}
+
+// Every action node's average strategy at a single runout. runout holds the dealt-card
+// indices most-significant first (turn then river); a node at chance depth `level` uses
+// the first `level` of them as a base-ND compound slot. Non-iso layout only.
+std::vector<std::vector<float>> CudaCfrSolver::averageStrategiesForRunout(const std::vector<int>& runout) const {
+    int N = (int)sg_.nodes.size();
+    std::vector<std::vector<float>> out(N);
+    for (int i = 0; i < N; i++) {
+        if (sg_.nodes[i].type != NT_ACTION) continue;
+        int lvl = level(i);
+        int slot = 0;
+        for (int k = 0; k < lvl; k++) slot = slot * ND_ + runout[k];   // base-ND, turn before river
+        out[i] = averageStrategyForSet(i, slot);
+    }
+    return out;
+}
+
 double CudaCfrSolver::exploitability() {
     int N = (int)sg_.nodes.size();
     // Upload the average strategy per action node for the best-response traversal.
