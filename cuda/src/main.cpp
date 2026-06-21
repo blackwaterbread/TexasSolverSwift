@@ -18,6 +18,8 @@ int main(int argc, char** argv) {
     std::string spot_out = "cuda/configs/spot_result.json";
     int iters = 200;
     bool force_stream = false;   // force host-streaming of river trainables (B-1)
+    double accuracy = -1.0;      // item E early stop: target exploitability (chips); <0 = off
+    int check_every = 0;         // exploitability check interval (iters); 0 = off
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if ((a == "-s" || a == "--subgame") && i + 1 < argc) subgame_path = argv[++i];
@@ -27,6 +29,8 @@ int main(int argc, char** argv) {
         else if (a == "--stream") force_stream = true;
         else if (a == "--spot" && i + 1 < argc) spot = argv[++i];
         else if (a == "--spot_out" && i + 1 < argc) spot_out = argv[++i];
+        else if (a == "--accuracy" && i + 1 < argc) accuracy = atof(argv[++i]);
+        else if (a == "--check_every" && i + 1 < argc) check_every = atoi(argv[++i]);
     }
 
     if (!texgpu::print_device_info()) {
@@ -140,9 +144,14 @@ int main(int argc, char** argv) {
                      : sg.chance_levels == 1 ? "turn/1-chance" : "river";
     printf("--- full CFR solve vs golden (%s) ---\n", kind);
     texgpu::CudaCfrSolver solver(sg, force_stream);
-    double secs = solver.train(iters);
+    double secs = solver.train(iters, accuracy, check_every);
+    int ran = solver.itersRun();
     auto avgs = solver.averageStrategies();
-    printf("solved %d iterations on GPU in %.3f s (%.2f iters/s).\n", iters, secs, iters / secs);
+    if (ran < iters)
+        printf("solved %d/%d iterations on GPU in %.3f s (%.2f iters/s) [early stop: exploit <= %.4f].\n",
+               ran, iters, secs, ran / secs, accuracy);
+    else
+        printf("solved %d iterations on GPU in %.3f s (%.2f iters/s).\n", ran, secs, ran / secs);
     // Deeper chance trees diverge more on mixed (non-unique / dynamics-sensitive)
     // spots due to CPU/GPU equilibrium selection — same effect seen in the turn
     // solver, just larger with two chance levels. Upper-round EVs and pure spots

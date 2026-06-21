@@ -18,8 +18,15 @@ public:
 
     bool streaming() const { return stream_on_; }
 
-    // Runs `iters` DCFR iterations. Returns wall-clock seconds spent in the loop.
-    double train(int iters);
+    // Runs up to `iters` DCFR iterations. Returns wall-clock seconds spent in the loop.
+    // Item E early stop (opt-in): when accuracy_chips >= 0 and check_every > 0, every
+    // check_every iterations measure exploitability and stop once it drops to/below
+    // accuracy_chips. Inert by default (runs the full count). Streamed solves can't
+    // afford the BR pass (exploitability returns < 0 there), so they never early-stop.
+    double train(int iters, double accuracy_chips = -1.0, int check_every = 0);
+
+    // Iterations actually run by the last train() (may be < requested if early-stopped).
+    int itersRun() const { return iters_run_; }
 
     // Average strategy per action node, indexed by node id; each entry has size
     // ntrainsets(node)*nact*ncards(node.player), layout (slot*nact + action)*nc + hand.
@@ -125,6 +132,15 @@ private:
     size_t chunkSetBytes(int nodeid) const;   // bytes of one turn chunk's ND sets
     void streamLoadChunk(const std::vector<int>& nodes, int t);   // turn t chunk host->device
     void streamStoreChunk(const std::vector<int>& nodes, int t);  // turn t chunk device->host
+
+    // Item D occupancy tuning knobs (perf-only, algorithm-invariant). Overridable at
+    // runtime for sweeping without a rebuild: TEXGPU_SD_THRESHOLD (O(n) vs tiled
+    // showdown boundary on opponent range size) and TEXGPU_BLOCK_T (kernel block size).
+    // 64 tuned on RTX 3070: for chance subgames the per-batch O(n) scan only amortizes
+    // past nc~64 (turn 37/51 -> tiled is +17%); large flop nc>=64 still takes O(n).
+    int sd_threshold_ = 64;
+    int block_T_ = 128;
+    int iters_run_ = 0;   // iterations the last train() actually ran (early-stop aware)
 
     int level(int nodeid) const;   // chance depth = node.round - root_round
 

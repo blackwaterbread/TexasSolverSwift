@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 // Available physical host RAM, used to decide whether host-streaming the (GB-scale)
 // river trainable is safe. Pinning/allocating more than fits destabilizes the OS, so
@@ -502,10 +503,10 @@ __global__ void g_avg(const __half* cum, float* avg, int nact, int nc) {
 
 static inline int blocks_for(size_t n, int t) { return (int)((n + t - 1) / t); }
 
-// Use the O(n) card-sum showdown when the opponent range is at least this large;
-// below it the O(n^2) tiled kernel avoids the per-batch scan overhead (measured:
-// tiled wins for tiny nc like the flop test's 13, O(n) wins by nc~37+).
-static const int kShowdownOnThreshold = 32;
+// Showdown dispatch uses the O(n) card-sum when the opponent range >= sd_threshold_
+// (default 64, env TEXGPU_SD_THRESHOLD); below it the O(n^2) tiled kernel avoids the
+// per-batch scan overhead. For chance subgames the scan runs once per deal, so the
+// O(n) crossover is ~nc 64 (tiled wins for turn's 37/51); B==1 river always uses O(n).
 
 // ---------------- solver ----------------
 
@@ -556,6 +557,8 @@ static void* dmalloc(size_t bytes, const char* what) {
 CudaCfrSolver::CudaCfrSolver(const Subgame& sg, bool stream) : sg_(sg) {
     root_round_ = sg.nodes[sg.root].round;
     ND_ = std::max(1, sg.ndeals());
+    if (const char* e = getenv("TEXGPU_SD_THRESHOLD")) sd_threshold_ = atoi(e);
+    if (const char* e = getenv("TEXGPU_BLOCK_T")) { int v = atoi(e); if (v >= 32 && v <= 1024) block_T_ = v; }
 
     for (int p = 0; p < 2; ++p) {
         int n = sg.ncombos(p);
@@ -846,7 +849,7 @@ float* CudaCfrSolver::arena_alloc(size_t n) {
 // no regret/strategy updates. Used post-training for the exploitability metric.
 void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_out, bool br) {
     const Node& nd = sg_.nodes[nodeid];
-    const int T = 128;
+    const int T = block_T_;
     int pn = ncards_[player];                 // util indexed by cfr player's range
     int on = ncards_[1 - player];             // reach indexed by opponent's range
     int lvl = level(nodeid);                  // chance depth (0 above all chances)
@@ -876,7 +879,7 @@ void CudaCfrSolver::cfr(int player, int nodeid, const float* d_reach, float* d_o
         // Chance subgame (B deals). For larger ranges the O(n) card-sum (batched
         // over deals) beats the O(n^2) tiled kernel; for tiny ranges the tiled
         // kernel avoids the per-batch scan overhead.
-        if (on >= kShowdownOnThreshold) {
+        if (on >= sd_threshold_) {
             int O = 1 - player;
             float* d_pref = arena_alloc((size_t)B * ((size_t)on + 1));
             int n2 = 2; while (n2 < on) n2 <<= 1;
@@ -1055,7 +1058,7 @@ void CudaCfrSolver::runIteration() {
     }
 }
 
-double CudaCfrSolver::train(int iters) {
+double CudaCfrSolver::train(int iters, double accuracy_chips, int check_every) {
     for (int p = 0; p < 2; ++p) {
         int n = ncards_[p];
         std::vector<float> w(n);
@@ -1063,6 +1066,20 @@ double CudaCfrSolver::train(int iters) {
         cudaMalloc(&d_init_[p], n * sizeof(float));
         cudaMemcpy(d_init_[p], w.data(), n * sizeof(float), cudaMemcpyHostToDevice);
     }
+
+    iters_run_ = iters;
+    bool early = (accuracy_chips >= 0.0 && check_every > 0);
+    // Item E: every check_every iters, measure exploitability off the current average
+    // and stop once it is <= accuracy_chips. exploitability() reads only d_cum_ (regrets
+    // untouched) so training resumes cleanly; it returns <0 when skipped (streaming),
+    // which never early-stops. Each check prints its exploitability line as progress.
+    auto reached = [&](int done) -> bool {
+        if (!early) return false;
+        cudaStreamSynchronize(stream_);
+        double e = exploitability();
+        if (e >= 0.0 && e <= accuracy_chips) { iters_run_ = done; return true; }
+        return false;
+    };
 
     // Streaming mode replays a host-side loop over turn chunks with interleaved
     // host<->device copies whose offsets change every chunk, which a single static
@@ -1075,6 +1092,7 @@ double CudaCfrSolver::train(int iters) {
         for (int it = 0; it < iters; ++it) {
             g_set_coefs<<<1, 1, 0, stream_>>>(d_coefs_, it);
             runIteration();
+            if (early && (it + 1) % check_every == 0 && reached(it + 1)) break;
         }
         cudaStreamSynchronize(stream_);
         t1 = std::chrono::high_resolution_clock::now();
@@ -1092,6 +1110,7 @@ double CudaCfrSolver::train(int iters) {
         for (int it = 0; it < iters; ++it) {
             g_set_coefs<<<1, 1, 0, stream_>>>(d_coefs_, it);   // per-iter, outside the graph
             cudaGraphLaunch(graph_exec_, stream_);
+            if (early && (it + 1) % check_every == 0 && reached(it + 1)) break;
         }
         cudaStreamSynchronize(stream_);
         t1 = std::chrono::high_resolution_clock::now();
